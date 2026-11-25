@@ -3,6 +3,7 @@
 #include "pm/dvfs.hpp"
 #include "pm/dvfs_sysfs.hpp"
 #include <chrono>
+#include <ctime>
 #include <csignal>
 #include <iostream>
 #include <iomanip>
@@ -188,7 +189,17 @@ int main(int argc, char** argv) try {
     auto rawpath=get("--raw","");
     if(!rawpath.empty()) { raw.open(rawpath,std::ios::binary); if(!raw) throw std::runtime_error("Cannot open raw video"); }
     std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal); std::signal(SIGHUP,on_signal);
-    auto start=Clock::now()+milliseconds(startup_ms), last_thermal=Clock::now()-milliseconds(dwell);
+    // Translate the runner's steady_clock origin into Linux CLOCK_MONOTONIC.
+    // Bracket clock_gettime to quantify the alignment uncertainty.
+    const auto anchor_before=Clock::now();
+    timespec anchor_ts{};
+    if(clock_gettime(CLOCK_MONOTONIC,&anchor_ts)!=0)
+        throw std::runtime_error("CLOCK_MONOTONIC unavailable");
+    const auto anchor_after=Clock::now();
+    const auto anchor_mid=anchor_before+(anchor_after-anchor_before)/2;
+    auto start=anchor_mid+milliseconds(startup_ms), last_thermal=Clock::now()-milliseconds(dwell);
+    const double origin_s=static_cast<double>(anchor_ts.tv_sec)+anchor_ts.tv_nsec/1e9+startup_ms/1000.;
+    const double anchor_uncertainty_us=ms(anchor_after-anchor_before)*500.;
     auto last_switch=Clock::now()-duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
     auto sleep_to=[&](Clock::time_point when) {
         while(!stop && Clock::now()<when)
@@ -202,7 +213,7 @@ int main(int argc, char** argv) try {
             last_thermal=now;
         }
     };
-    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready\n";
+    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready,release_origin_monotonic_s,clock_anchor_uncertainty_us\n";
     for(int i=0;i<jobs&&!stop;++i) {
         auto release=start+milliseconds(static_cast<long long>(i)*period+static_cast<long long>(i/burst)*gap);
         const auto& workload=workloads[i%workloads.size()];
@@ -340,7 +351,8 @@ int main(int argc, char** argv) try {
             <<job_deadline<<','<<from<<','<<target<<','<<observed_freq<<','<<transition_ms<<','
             <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<','
             <<timing.write_ms<<','<<timing.cap_seen_ms<<','<<timing.freq_seen_ms<<','<<timing.late<<','
-            <<switch_start_ms<<','<<switch_ready_ms<<','<<on_path_ms<<','<<pre_ready<<'\n'<<std::flush;
+            <<switch_start_ms<<','<<switch_ready_ms<<','<<on_path_ms<<','<<pre_ready<<','
+            <<std::setprecision(9)<<origin_s<<','<<anchor_uncertainty_us<<'\n'<<std::flush;
     }
     if(!stop && integer("--tail-idle",0)!=0) {
         const auto horizon=start+milliseconds(static_cast<long long>(jobs)*period+

@@ -53,9 +53,14 @@ Files per run:
   trace status, ADC call latency and Python process CPU time (excludes
   vcgencmd child CPU time and kernel overhead).
 
-All timestamps use monotonic time. Existing job timestamps are relative to
-runner release origin, not absolute monotonic time; precise alignment with
-individual jobs requires an explicit runner clock anchor. Multi-rate PMIC
+All timestamps use monotonic time. Job timestamps are relative to the runner
+release origin. New jobs.csv rows include release_origin_monotonic_s and
+clock_anchor_uncertainty_us. Add release_ms/1000, dispatch_ms/1000,
+finish_ms/1000 or transition_start_ms/1000 to that origin to align jobs
+and transitions with telemetry and trace events. Legacy results without
+this anchor cannot be precisely aligned. Rebuild pm_runner for the new columns.
+The uncertainty records half the bracketing interval of clock_gettime,
+not all possible timestamp or ADC observation error. Multi-rate PMIC
 reads do not establish the hardware ADC update rate, and VDD_CORE does not
 represent whole-board energy. Missing readings must not be interpolated
 silently. The current benchmark retains its original approximate energy
