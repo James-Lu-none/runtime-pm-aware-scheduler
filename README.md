@@ -95,7 +95,7 @@ Generate latency profiles from the actual job logs, using nan for energy/power
 until separately measured. The state filter is strict; a missing state or
 fewer than ten matching jobs fails calibration:
 
-    python3 scripts/profile.py --row results/cpu/jobs.csv cpu active nan nan --row results/gpu-warm/jobs.csv gpu active nan nan > profile.csv
+    python3 scripts/build_profile.py --row results/cpu/jobs.csv cpu active nan nan --row results/gpu-warm/jobs.csv gpu active nan nan > profile.csv
     ./build/pm_runner --mode eft --profile profile.csv --gpu-device "$GPU_PATH" --jobs 100
 
 EFT ignores GPU resume state by design. For energy and adaptive modes, replace
