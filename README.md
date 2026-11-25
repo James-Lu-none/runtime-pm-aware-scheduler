@@ -7,6 +7,10 @@ under workload deadlines and average rail-power constraints.
 
 ## Status
 
+Current direction: CPU-centric deadline-aware DVFS and power management.
+The previous heterogeneous and V3D runtime PM experiments remain available.
+For the next CPU-only inference sweep, see [CPU profiling](docs/cpu-inference.md).
+
 Initial MVP: ncnn CPU/Vulkan backend, deterministic frame replay, serial
 dispatch, six policies, state-aware profile lookup, in-tree thermal hysteresis,
 PMIC telemetry, unit tests and experiment scripts. Hardware validation is
