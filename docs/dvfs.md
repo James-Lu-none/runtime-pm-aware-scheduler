@@ -57,3 +57,8 @@ calibration profile.
 If GPU is dominated by a CPU cap, favor CPU DVFS for this workload; keep
 runtime PM characterization as a separate system result. If not, retain both
 devices as candidate configurations for a future deadline-aware policy.
+
+CPUFreq QoS limit changes can be applied asynchronously by the kernel policy
+workqueue. The script polls readback for up to five seconds and requires three
+consecutive matching reads (50 ms apart), including on restoration. A persistent
+mismatch still aborts the run; it is not silently accepted.

@@ -18,10 +18,26 @@ ROOT = Path(__file__).resolve().parents[1]
 def read(path):
     return path.read_text().strip()
 
-def write(path, value):
-    path.write_text(str(value) + "\n")
-    if read(path) != str(value):
-        raise RuntimeError(f"Readback mismatch: {path}: expected {value}, got {read(path)}")
+def write(path, value, timeout=5.0, poll_interval=.05):
+    """Wait for asynchronous CPUFreq QoS updates and stable policy readback."""
+    expected = str(value)
+    path.write_text(expected + "\n")
+    deadline = time.monotonic() + timeout
+    stable = 0
+    while True:
+        observed = read(path)
+        if observed == expected:
+            stable += 1
+            if stable >= 3:
+                return
+        else:
+            stable = 0
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Readback timeout after {timeout:g}s: {path}: "
+                f"expected {expected}, got {observed}"
+            )
+        time.sleep(poll_interval)
 
 def percentile(values, q):
     return sorted(values)[math.ceil(q * len(values))-1]
