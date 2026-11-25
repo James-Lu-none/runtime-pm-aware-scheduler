@@ -23,6 +23,9 @@ class HintReplayTests(unittest.TestCase):
         self.assertEqual(hint_spec("hint_static_25"),("static",25))
         self.assertTrue(dynamic_policy("hint_fixed_0"))
         self.assertFalse(dynamic_policy("ondemand"))
+        self.assertEqual(hint_spec("thermal_static_25"),("static_mixed",25))
+        self.assertEqual(hint_spec("thermal_off_25"),("mixed",25))
+        self.assertTrue(dynamic_policy("thermal_dynamic_25"))
 
 if __name__=="__main__":
     unittest.main()

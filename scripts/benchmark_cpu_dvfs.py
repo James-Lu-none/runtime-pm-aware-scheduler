@@ -428,7 +428,14 @@ def sweep(a,cpu,trans,freqs):
     results=[]
     try:
         for repeat in range(1,a.repeats+1):
-            for label,gov,cap in (configs if repeat%2 else list(reversed(configs))):
+            if a.thermal_compare:
+                shift=(repeat-1)%len(configs)
+                order=configs[shift:]+configs[:shift]
+                if ((repeat-1)//len(configs))%2:
+                    order=list(reversed(order))
+            else:
+                order=configs if repeat%2 else list(reversed(configs))
+            for label,gov,cap in order:
                 write(capfile,orig_cap)
                 write(govfile,orig_gov)
                 cool(a.zone,a.start_temp)

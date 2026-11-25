@@ -90,3 +90,7 @@ The evaluation defaults to [multi-rate telemetry](telemetry.md). Run the observe
 ## Limited application hints
 
 See [randomized hint replay](hint-replay.md) for the lead-time sweep and static-map baseline.
+
+## Thermal supervisor comparison
+
+See [thermal-aware hint scheduling](thermal-supervisor.md) for the three-arm warm-start test.
