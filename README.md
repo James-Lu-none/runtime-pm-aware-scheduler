@@ -115,6 +115,10 @@ initialization in mixed policies. Fixed backend modes do not require profiles.
 
 ## Thermal / DVFS
 
+For the standalone arithmetic workload, run the automated CPUFreq sweep and
+GPU baseline: `sudo python3 scripts/profile_dvfs.py`. See
+[DVFS profiling protocol](docs/dvfs.md) for restoration, validation and Pareto CSVs.
+
 Optional in-tree controller, no external thermal project dependency.
 It uses Linux cpufreq scaling_max_freq and thermal zone temperature, not a
 new governor. First verify policy and thermal-zone paths with probe.sh.
