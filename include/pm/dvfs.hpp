@@ -93,13 +93,13 @@ inline std::optional<double> switch_cost(const SwitchCosts& costs,long from,long
 inline DvfsDecision choose_dvfs(const std::vector<CpuCost>& costs,const SwitchCosts& switches,
                                 long current,long ceiling,double slack,double margin,
                                 double since_switch,double dwell,double min_saving,
-                                bool ignore_transition=false) {
+                                bool ignore_transition=false,double pre_release_ms=0.) {
     std::vector<DvfsDecision> options;
     for(auto& c:costs) {
         if(c.khz>ceiling) continue;
         auto sw=switch_cost(switches,current,c.khz);
         if(!sw) continue; // no invented zero cost for an unprofiled transition
-        double total=c.service_ms+(ignore_transition?0.:*sw)+margin;
+        double total=c.service_ms+(ignore_transition?0.:std::max(0.,*sw-pre_release_ms))+margin;
         options.push_back({c.khz,total,*sw,c.energy_mj,total<=slack,"energy"});
     }
     if(options.empty()) throw std::runtime_error("No calibrated frequency under thermal ceiling");

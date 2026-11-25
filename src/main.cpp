@@ -48,7 +48,8 @@ int main(int argc, char** argv) try {
     auto integer=[&](const std::string& k,int d){return std::stoi(get(k,std::to_string(d)));};
     auto real=[&](const std::string& k,double d){return std::stod(get(k,std::to_string(d)));};
     const std::map<std::string,pm::Mode> modes={{"cpu",pm::Mode::cpu},{"gpu",pm::Mode::gpu},{"rr",pm::Mode::rr},{"eft",pm::Mode::eft},{"energy",pm::Mode::energy},{"adaptive",pm::Mode::adaptive}};
-    const bool dvfs=get("--mode","cpu")=="dvfs";
+    const bool lookahead=get("--mode","cpu")=="lookahead";
+    const bool dvfs=lookahead || get("--mode","cpu")=="dvfs";
     auto mode=dvfs?pm::Mode::cpu:modes.at(get("--mode","cpu"));
     bool gpu=mode!=pm::Mode::cpu && integer("--gpu",1)!=0;
     if(mode==pm::Mode::gpu && !gpu) throw std::runtime_error("GPU mode requires GPU");
@@ -97,6 +98,9 @@ int main(int argc, char** argv) try {
     const double switch_dwell=real("--dvfs-dwell-ms",250);
     const int switch_timeout=integer("--dvfs-timeout-ms",100);
     const bool ignore_switch=integer("--dvfs-ignore-transition",0)!=0;
+    const int lead_ms=integer("--dvfs-lead-ms",150), startup_ms=integer("--startup-lead-ms",lookahead?200:0);
+    if((lookahead && (lead_ms<0||lead_ms>period))||startup_ms<0||startup_ms>1000)
+        throw std::runtime_error("Invalid look-ahead or startup lead");
     if(dvfs && (pool || gap!=0 || !std::isfinite(margin)||margin<0 ||
        !std::isfinite(saving)||saving<0||saving>=1 || !std::isfinite(switch_dwell)||switch_dwell<0 ||
        switch_timeout<10||switch_timeout>1000))
@@ -183,13 +187,88 @@ int main(int argc, char** argv) try {
     std::ifstream raw;
     auto rawpath=get("--raw","");
     if(!rawpath.empty()) { raw.open(rawpath,std::ios::binary); if(!raw) throw std::runtime_error("Cannot open raw video"); }
-    std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
-    auto start=Clock::now(), last_thermal=start-milliseconds(dwell);
-    auto last_switch=start-duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
-    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms\n";
+    std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal); std::signal(SIGHUP,on_signal);
+    auto start=Clock::now()+milliseconds(startup_ms), last_thermal=Clock::now()-milliseconds(dwell);
+    auto last_switch=Clock::now()-duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
+    auto sleep_to=[&](Clock::time_point when) {
+        while(!stop && Clock::now()<when)
+            std::this_thread::sleep_until(std::min(when,Clock::now()+milliseconds(50)));
+    };
+    auto check_thermal=[&](double temp) {
+        if(!std::isfinite(temp)||temp>=75.) throw std::runtime_error("DVFS thermal guard");
+        auto now=Clock::now();
+        if(thermal && now-last_thermal>=milliseconds(dwell)) {
+            thermal_ceiling=pm::thermal_step(thermal_ceiling,temp,low,high,calibrated);
+            last_thermal=now;
+        }
+    };
+    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready\n";
     for(int i=0;i<jobs&&!stop;++i) {
         auto release=start+milliseconds(static_cast<long long>(i)*period+static_cast<long long>(i/burst)*gap);
-        while(!stop && Clock::now()<release) std::this_thread::sleep_until(std::min(release,Clock::now()+milliseconds(50)));
+        const auto& workload=workloads[i%workloads.size()];
+        const double job_deadline=deadlines[i%deadlines.size()];
+        pm::ReadyResult timing;
+        double switch_start_ms=0,switch_ready_ms=0,on_path_ms=0;
+        int pre_ready=-1;
+        long planned_from=0, planned_target=0;
+        double plan_prediction=0;
+        int plan_feasible=-1;
+        const char* plan_reason="fixed";
+        auto apply_switch=[&](long target) {
+            auto before=Clock::now();
+            timing=actuator->set_ready(target,switch_timeout);
+            auto after=Clock::now();
+            switch_start_ms=ms(before-start);
+            switch_ready_ms=ms(after-start);
+            on_path_ms=std::max(0.,ms(after-std::max(before,release)));
+            pre_ready=after<=release;
+            last_switch=after;
+            expected_cap=target;
+        };
+        if(lookahead) {
+            actuator->validate();
+            planned_from=actuator->cap();
+            if(planned_from!=expected_cap || actuator->freq()!=planned_from)
+                throw std::runtime_error("CPU cap/frequency drift before look-ahead");
+            check_thermal(pm::temperature(zone));
+            auto now=Clock::now();
+            const auto late_start=std::max(now,release-milliseconds(lead_ms));
+            const double hidden=std::max(0.,ms(release-late_start));
+            auto decision=pm::choose_dvfs(cpu_costs.at(workload),switches,planned_from,thermal_ceiling,
+                job_deadline-std::max(0.,ms(now-release)),margin,ms(late_start-last_switch),
+                switch_dwell,saving,ignore_switch,hidden);
+            planned_target=decision.khz;
+            plan_prediction=decision.predicted_ms;
+            plan_feasible=decision.feasible;
+            plan_reason=decision.reason;
+            if(planned_target!=planned_from) {
+                auto when=planned_target>planned_from?late_start:now;
+                bool stay_feasible=false;
+                for(const auto& c:cpu_costs.at(workload))
+                    if(c.khz==planned_from && c.khz<=thermal_ceiling &&
+                       c.service_ms+margin<=job_deadline-std::max(0.,ms(now-release)))
+                        stay_feasible=true;
+                if(stay_feasible) {
+                    auto dwell_end=last_switch+duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
+                    when=std::max(when,dwell_end);
+                }
+                sleep_to(when);
+                if(stop) break;
+                check_thermal(pm::temperature(zone));
+                if(planned_target>thermal_ceiling) {
+                    auto fallback=pm::choose_dvfs(cpu_costs.at(workload),switches,planned_from,thermal_ceiling,
+                        job_deadline-std::max(0.,ms(Clock::now()-release)),margin,
+                        ms(Clock::now()-last_switch),switch_dwell,saving,ignore_switch,
+                        std::max(0.,ms(release-Clock::now())));
+                    planned_target=fallback.khz;
+                    plan_prediction=fallback.predicted_ms;
+                    plan_feasible=fallback.feasible;
+                    plan_reason="thermal_replan";
+                }
+                if(planned_target!=planned_from) apply_switch(planned_target);
+            }
+        }
+        sleep_to(release);
         if(stop) break;
         if(raw.is_open()) {
             if(!raw.read(reinterpret_cast<char*>(frame.data()),frame.size())) {
@@ -207,24 +286,29 @@ int main(int argc, char** argv) try {
         long khz=cap.current();
         if(khz<0) khz=0;
         auto dispatch=Clock::now();
-        const auto& workload=workloads[i%workloads.size()];
         auto& e=engines.at(workload);
-        const double job_deadline=deadlines[i%deadlines.size()];
-        const long from=khz;
+        const long from=lookahead?planned_from:khz;
         double transition_ms=0, predicted_ms=0;
         int predicted_feasible=-1;
         const char* reason="fixed";
         long target=khz, observed_freq=pm::read_long(get("--cpufreq-policy","/sys/devices/system/cpu/cpufreq/policy0")+"/scaling_cur_freq");
-        if(dvfs) {
+        if(lookahead) {
+            actuator->validate();
+            if(!std::isfinite(temp)||temp>=75.) throw std::runtime_error("DVFS thermal guard");
+            target=planned_target;
+            predicted_ms=plan_prediction;
+            predicted_feasible=plan_feasible;
+            reason=plan_reason;
+            transition_ms=timing.elapsed_ms;
+            khz=actuator->cap();
+            observed_freq=actuator->freq();
+            if(khz!=target || observed_freq!=target || khz!=expected_cap)
+                throw std::runtime_error("Look-ahead target not observed at dispatch");
+        } else if(dvfs) {
             actuator->validate();
             if(khz!=expected_cap || actuator->freq()!=khz)
                 throw std::runtime_error("CPU cap/frequency drift; cannot apply calibrated transition model");
-            if(!std::isfinite(temp) || temp>=75.)
-                throw std::runtime_error("DVFS thermal guard");
-            if(thermal && now-last_thermal>=milliseconds(dwell)) {
-                thermal_ceiling=pm::thermal_step(thermal_ceiling,temp,low,high,calibrated);
-                last_thermal=now;
-            }
+            check_thermal(temp);
             auto decision=pm::choose_dvfs(cpu_costs.at(workload),switches,khz,thermal_ceiling,
                 job_deadline-ms(Clock::now()-release),margin,ms(Clock::now()-last_switch),
                 switch_dwell,saving,ignore_switch);
@@ -233,9 +317,8 @@ int main(int argc, char** argv) try {
             predicted_feasible=decision.feasible;
             reason=decision.reason;
             if(target!=khz) {
-                transition_ms=actuator->set_ready(target,switch_timeout);
-                last_switch=Clock::now();
-                expected_cap=target;
+                apply_switch(target);
+                transition_ms=timing.elapsed_ms;
             }
             khz=actuator->cap();
             observed_freq=actuator->freq();
@@ -255,7 +338,9 @@ int main(int argc, char** argv) try {
             <<(pick.device?pm::name(*pick.device):"none")<<','<<pm::name(state)<<','<<khz<<','<<temp<<','<<service<<','
             <<ms(finish-release)<<','<<(!pick.device||ms(finish-release)>job_deadline)<<','<<status<<','<<checksum<<','<<workload<<','<<w<<','<<h<<','<<threads<<','
             <<job_deadline<<','<<from<<','<<target<<','<<observed_freq<<','<<transition_ms<<','
-            <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<'\n'<<std::flush;
+            <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<','
+            <<timing.write_ms<<','<<timing.cap_seen_ms<<','<<timing.freq_seen_ms<<','<<timing.late<<','
+            <<switch_start_ms<<','<<switch_ready_ms<<','<<on_path_ms<<','<<pre_ready<<'\n'<<std::flush;
     }
     if(!stop && integer("--tail-idle",0)!=0) {
         const auto horizon=start+milliseconds(static_cast<long long>(jobs)*period+

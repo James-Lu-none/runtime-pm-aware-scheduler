@@ -1,4 +1,5 @@
 #include "pm/dvfs.hpp"
+#include "pm/dvfs_sysfs.hpp"
 #include <iostream>
 #include <cstdlib>
 using namespace pm;
@@ -26,4 +27,13 @@ int main() {
     check(y.khz==b,"transition-blind ablation");
     auto z=choose_dvfs(large,{},a,c,20,3,1000,250,.05);
     check(z.khz==a&&!z.feasible,"unknown transitions never zero");
+    check(choose_dvfs(small,sw,c,c,18,3,1000,250,.05,false,150).khz==a,
+          "pre-release downscale makes small feasible at low frequency");
+    check(choose_dvfs(large,sw,a,c,68,3,1000,250,.05,false,150).khz==b,
+          "pre-release upscale permits medium frequency");
+    check(choose_dvfs(large,sw,a,c,68,3,1000,250,.05,false,1).khz==c,
+          "short lead retains residual transition penalty");
+    check(choose_dvfs(large,sw,a,b,68,3,1000,250,.05,false,150).khz==b,
+          "look-ahead respects ceiling");
+    check(!ready_late(100,100)&&ready_late(126.739,100),"late readback not on-time success");
 }

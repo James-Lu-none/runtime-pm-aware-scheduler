@@ -4,6 +4,13 @@
 #include <thread>
 #include <iostream>
 namespace pm {
+struct ReadyResult {
+    double elapsed_ms=0, write_ms=0, cap_seen_ms=-1, freq_seen_ms=-1;
+    bool late=false;
+};
+inline bool ready_late(double elapsed_ms,int timeout_ms) {
+    return elapsed_ms>timeout_ms;
+}
 // Independent controller actuator. The external experiment driver owns
 // governor selection and crash-safe best-effort restoration.
 class DvfsActuator {
@@ -16,16 +23,29 @@ class DvfsActuator {
         if(!(f<<target<<'\n') || !(f.flush()))
             throw std::runtime_error("DVFS cap write failed");
     }
-    double wait(long target,int timeout_ms,bool set) {
+    ReadyResult wait(long target,int timeout_ms,bool set) {
         auto start=Clock::now();
+        auto elapsed=[&](){return std::chrono::duration<double,std::milli>(Clock::now()-start).count();};
+        ReadyResult result;
         if(set) write_cap(target);
-        auto end=start+std::chrono::milliseconds(timeout_ms);
-        while(Clock::now()<=end) {
-            if(cap()==target && freq()==target)
-                return std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+        result.write_ms=elapsed();
+        const int recovery_ms=std::max(timeout_ms,500);
+        while(true) {
+            const auto observed_cap=cap();
+            const double cap_at=elapsed();
+            const auto observed_freq=freq();
+            const double freq_at=elapsed();
+            if(observed_cap==target && result.cap_seen_ms<0) result.cap_seen_ms=cap_at;
+            if(observed_freq==target && result.freq_seen_ms<0) result.freq_seen_ms=freq_at;
+            result.elapsed_ms=freq_at;
+            if(freq_at>recovery_ms)
+                throw std::runtime_error("DVFS recovery timeout for "+std::to_string(target));
+            if(observed_cap==target && observed_freq==target) {
+                result.late=ready_late(freq_at,timeout_ms);
+                return result;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
-        throw std::runtime_error("DVFS ready timeout for "+std::to_string(target));
     }
 public:
     explicit DvfsActuator(std::string dir):dir_(std::move(dir)),initial_(cap()),
@@ -43,7 +63,7 @@ public:
         if(governor()!="performance" || read_long(dir_+"/scaling_min_freq")!=min_)
             throw std::runtime_error("External CPUFreq policy change");
     }
-    double set_ready(long target,int timeout_ms) {
+    ReadyResult set_ready(long target,int timeout_ms) {
         validate();
         if(target<min_ || target>initial_) throw std::runtime_error("Unsafe DVFS target");
         bool set=cap()!=target;
