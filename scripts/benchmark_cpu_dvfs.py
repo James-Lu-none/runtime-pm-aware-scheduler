@@ -114,7 +114,14 @@ def analyze(dest,label,repeat,a,cap):
     # Approximate telemetry window includes model initialization and trailing
     # idle; equal release horizon is enforced by runner --tail-idle.
     valid=valid_caps and .9<=elapsed/horizon<=1.1 and max(float(j["finish_ms"]) for j in jobs)<=1.1*horizon*1000
+    telemetry=json.loads((dest/"telemetry_metadata.json").read_text())
+    trace_valid=(not telemetry["trace_requested"]) or telemetry.get("trace_overrun") is False
     result=dict(policy=label,repeat=repeat,jobs=len(jobs),misses=misses,
+        telemetry_mode=telemetry["mode"],pmic_samples=telemetry["pmic"]["samples"],
+        pmic_median_gap_ms=telemetry["pmic"]["median_gap_ms"],
+        pmic_p95_gap_ms=telemetry["pmic"]["p95_gap_ms"],
+        trace_requested=int(telemetry["trace_requested"]),trace_valid=int(trace_valid),
+        frequency_trace_rows=telemetry.get("trace_event_rows",0),
         miss_pct=100*misses/len(jobs),p95_service_ms=percentile(service,.95),
         p95_response_ms=percentile(response,.95),p99_response_ms=percentile(response,.99),
         max_response_ms=max(response),rail_w=energy/elapsed,
@@ -159,6 +166,15 @@ def main():
     p.add_argument("--lead-ms",type=int,default=150,help="Look-ahead upscale lead")
     p.add_argument("--startup-lead-ms",type=int,default=200,help="Same initial release offset for all policies")
     p.add_argument("--lookahead-only",action="store_true",help="Only run V2 for a smoke test")
+    p.add_argument("--telemetry",choices=["legacy","multi"],default="multi")
+    p.add_argument("--freq-ms",type=int,default=5)
+    p.add_argument("--pmic-ms",type=int,default=30)
+    p.add_argument("--temp-ms",type=int,default=500)
+    p.add_argument("--idle-ms",type=int,default=100)
+    p.add_argument("--trace-buffer-kb",type=int,default=8192)
+    p.add_argument("--no-frequency-trace",action="store_true")
+    p.add_argument("--observer-check",action="store_true",
+                   help="Compare legacy and multi telemetry using identical native governor workload")
     p.add_argument("--margin-ms",type=float,default=3)
     p.add_argument("--dwell-ms",type=float,default=250)
     p.add_argument("--min-saving",type=float,default=.05)
@@ -174,6 +190,11 @@ def main():
     p.add_argument("--runner",type=Path,default=ROOT/"build/pm_runner")
     p.add_argument("--out",type=Path,default=ROOT/("results/cpu-dvfs-"+time.strftime("%Y%m%d-%H%M%S")))
     a=p.parse_args()
+    if a.observer_check and a.lookahead_only:
+        p.error("--observer-check and --lookahead-only are mutually exclusive")
+    if not (1<=a.freq_ms<=10000 and 30<=a.pmic_ms<=10000 and
+            50<=a.temp_ms<=10000 and 20<=a.idle_ms<=10000 and 128<=a.trace_buffer_kb<=32768):
+        p.error("Invalid telemetry interval or trace buffer")
     if os.geteuid()!=0:
         p.error("Run with sudo")
     if not (len(a.models)==len(a.deadlines) and a.jobs>=20 and a.jobs%len(a.models)==0 and
@@ -215,6 +236,8 @@ def sweep(a,cpu,trans,freqs):
         configs.append(("transition_blind","performance",orig_cap))
     if a.lookahead_only:
         configs=[x for x in configs if x[0]=="lookahead"]
+    if a.observer_check:
+        configs=[("observer_legacy",orig_gov,orig_cap),("observer_multi",orig_gov,orig_cap)]
     a.out.mkdir(parents=True,exist_ok=False)
     meta=dict(policy=str(a.policy),governor=orig_gov,min_khz=orig_min,max_khz=orig_cap,
               cpu_profile=str(cpu),transition_profile=str(trans),configs=configs,
@@ -225,6 +248,9 @@ def sweep(a,cpu,trans,freqs):
               margin_ms=a.margin_ms,dwell_ms=a.dwell_ms,min_saving=a.min_saving,use_max=a.use_max,
               thermal=a.thermal,thermal_low=a.thermal_low,thermal_high=a.thermal_high,
               lead_ms=a.lead_ms,startup_lead_ms=a.startup_lead_ms,
+              telemetry=a.telemetry,observer_check=a.observer_check,
+              freq_ms=a.freq_ms,pmic_ms=a.pmic_ms,temp_ms=a.temp_ms,idle_ms=a.idle_ms,
+              trace_frequency=not a.no_frequency_trace,trace_buffer_kb=a.trace_buffer_kb,
               start_temp=a.start_temp,max_temp=a.max_temp,kernel=os.uname().release)
     (a.out/"original_settings.json").write_text(json.dumps(meta,indent=2)+"\n")
     print("Results:",a.out,flush=True)
@@ -244,9 +270,15 @@ def sweep(a,cpu,trans,freqs):
                     raise RuntimeError("CPUFreq minimum changed")
                 dest=a.out/f"r{repeat}-{label}"
                 dynamic=label in ("adaptive","transition_blind","lookahead")
+                telemetry=("legacy" if label=="observer_legacy" else "multi") if a.observer_check else a.telemetry
+                collector=["--telemetry",telemetry,"--freq-ms",str(a.freq_ms),"--pmic-ms",str(a.pmic_ms),
+                           "--temp-ms",str(a.temp_ms),"--idle-ms",str(a.idle_ms),
+                           "--trace-buffer-kb",str(a.trace_buffer_kb)]
+                if telemetry=="multi" and not a.no_frequency_trace:
+                    collector.append("--trace-frequency")
                 cmd=[sys.executable,str(ROOT/"scripts/run.py"),"--out",str(dest),
                      "--policy",str(a.policy),"--zone",str(a.zone),"--interval","0.137",
-                     "--",str(a.runner),"--mode","lookahead" if label=="lookahead" else ("dvfs" if dynamic else "cpu"),
+                     *collector,"--",str(a.runner),"--mode","lookahead" if label=="lookahead" else ("dvfs" if dynamic else "cpu"),
                      "--gpu","0","--workload",",".join(a.models),"--model-dir",str(a.model_dir),
                      "--threads",str(a.threads),"--jobs",str(a.jobs),"--period-ms",str(a.period_ms),
                      "--deadlines-ms",",".join(map(str,a.deadlines)),"--tail-idle","1",
@@ -293,6 +325,9 @@ def sweep(a,cpu,trans,freqs):
         x["miss_pct"]=100*x["misses"]/x["jobs"]
         for key in ("p95_response_ms","p99_response_ms","rail_w","approx_energy_mj_job","switches","switch_p95_ms","on_path_switch_p95_ms"):
             x[key]=statistics.median(g[key] for g in group)
+        x["telemetry_mode"]=group[0]["telemetry_mode"]
+        x["pmic_median_gap_ms"]=statistics.median(g["pmic_median_gap_ms"] for g in group)
+        x["trace_valid"]=int(all(g["trace_valid"] for g in group))
         x["late_switches"]=sum(g["late_switches"] for g in group)
         x["pre_release_switches"]=sum(g["pre_release_switches"] for g in group)
         x["total_switches"]=sum(g["switches"] for g in group)
