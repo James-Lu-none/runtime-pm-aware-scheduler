@@ -8,7 +8,7 @@ p=argparse.ArgumentParser()
 p.add_argument("--row", action="append", nargs=5, metavar=("JOBS_CSV","BACKEND","STATE","ENERGY_MJ","POWER_W"), required=True,
                help="energy/power can be nan; one row per backend/state/cap")
 a=p.parse_args()
-w=csv.writer(sys.stdout)
+w=csv.writer(sys.stdout, lineterminator='\n')
 w.writerow(["backend","state","cap_khz","p95_ms","energy_mj","power_w"])
 keys=set()
 for path,backend,state,energy,power in a.row:
