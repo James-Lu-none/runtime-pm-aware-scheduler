@@ -1,0 +1,19 @@
+#version 450
+// Each invocation loads 16 scalars, uses independent accumulators, stores once.
+// Runtime loop trip count prevents compile-time specialization by iteration count.
+layout(local_size_x=64) in;
+layout(std430, binding=0) readonly buffer Input { vec4 v[]; } src;
+layout(std430, binding=1) writeonly buffer Output { vec4 v[]; } dst;
+layout(push_constant) uniform Params { uint blocks; uint rounds; } p;
+void main() {
+    uint block = gl_GlobalInvocationID.x;
+    if (block >= p.blocks) return;
+    uint i = block * 4u;
+    vec4 x0=src.v[i], x1=src.v[i+1], x2=src.v[i+2], x3=src.v[i+3];
+    const vec4 a=vec4(0.99991), b=vec4(0.00013);
+    for (uint j=0; j<p.rounds; ++j) {
+        x0=fma(x0,a,b); x1=fma(x1,a,b);
+        x2=fma(x2,a,b); x3=fma(x3,a,b);
+    }
+    dst.v[i]=x0; dst.v[i+1]=x1; dst.v[i+2]=x2; dst.v[i+3]=x3;
+}

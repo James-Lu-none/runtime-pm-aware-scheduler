@@ -32,6 +32,11 @@ Use -DPM_SYSTEM_NCNN=ON to use an installed ncnn package, or
     cmake --build build-test
     ctest --test-dir build-test --output-on-failure
 
+## Arithmetic intensity microbenchmark
+
+Standalone FP32 CPU NEON versus Vulkan compute characterization, independent of
+ncnn. See [build and measurement protocol](docs/arithmetic.md).
+
 ## MobileNetV4 workload
 
 Three pretrained Conv variants, RGB FP32 inference, numerical parity checks and

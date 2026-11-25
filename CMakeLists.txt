@@ -29,3 +29,25 @@ if(PM_BUILD_RUNNER)
   target_link_libraries(pm_runner PRIVATE pm_policy ncnn)
   target_compile_options(pm_runner PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# Independent FP32 arithmetic-intensity benchmark; no ncnn dependency.
+option(PM_BUILD_MICROBENCH "Build standalone CPU/Vulkan microbenchmark" OFF)
+if(PM_BUILD_MICROBENCH)
+  find_package(Vulkan REQUIRED)
+  find_package(OpenMP REQUIRED)
+  find_program(GLSLANG_VALIDATOR glslangValidator)
+  if(NOT GLSLANG_VALIDATOR)
+    message(FATAL_ERROR "Install glslang-tools (glslangValidator)")
+  endif()
+  set(AI_SPV "${CMAKE_CURRENT_BINARY_DIR}/arithmetic.comp.spv")
+  add_custom_command(OUTPUT "${AI_SPV}"
+    COMMAND "${GLSLANG_VALIDATOR}" -V --target-env vulkan1.0
+      "${CMAKE_CURRENT_SOURCE_DIR}/microbench/arithmetic.comp" -o "${AI_SPV}"
+    DEPENDS microbench/arithmetic.comp VERBATIM)
+  add_custom_target(ai_shader DEPENDS "${AI_SPV}")
+  add_executable(pm_microbench microbench/main.cpp)
+  add_dependencies(pm_microbench ai_shader)
+  target_link_libraries(pm_microbench PRIVATE Vulkan::Vulkan OpenMP::OpenMP_CXX)
+  target_compile_definitions(pm_microbench PRIVATE PM_SHADER_PATH="${AI_SPV}")
+  target_compile_options(pm_microbench PRIVATE -Wall -Wextra -Wpedantic -O3)
+endif()
