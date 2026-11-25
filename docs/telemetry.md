@@ -3,8 +3,10 @@
 
 The CPU DVFS evaluation defaults to multi-rate collection. Existing profiling
 scripts and direct run.py calls retain legacy mode unless explicitly selected.
-Default requested intervals: frequency/cap 5 ms, PMIC 30 ms, temperature
-500 ms, cpuidle cumulative counters 100 ms. CPUFreq kernel trace events
+Benchmark defaults (validated low-observer protocol): frequency/cap 500 ms,
+PMIC 137 ms, temperature 500 ms, cpuidle cumulative counters 1000 ms.
+The old high-rate configuration remains available explicitly with
+--freq-ms 5 --pmic-ms 30 --temp-ms 500 --idle-ms 100. CPUFreq kernel trace events
 are enabled for the whole multi-rate evaluation by default. No GPU
 monitoring is needed for CPU experiments. Polling is best-effort, not
 real-time, and sysfs reads may block. The independent sysfs sampler

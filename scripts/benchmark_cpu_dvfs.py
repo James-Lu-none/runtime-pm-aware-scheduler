@@ -420,12 +420,12 @@ def sweep(a,cpu,trans,freqs):
     if not summary:
         raise RuntimeError("No valid configurations")
     save(a.out/"summary.csv",summary)
-    print("\npolicy,misses,jobs,p95_response_ms,energy_mj_job,rail_w,switches,switch_p95_ms,on_path_switch_p95_ms,pre_release_switches,total_switches,late_switches,goodput,energy_per_on_time_mj")
+    print("\npolicy,misses,jobs,p95_response_ms,energy_mj_job,rail_w,switches,switch_p95_ms,on_path_switch_p95_ms,pre_release_switches,total_switches,late_switches,goodput,energy_per_on_time_mj,hint_median_available_ms")
     for x in summary:
         print(f'{x["policy"]},{x["misses"]},{x["jobs"]},{x["p95_response_ms"]:.3f},'
               f'{x["approx_energy_mj_job"]:.3f},{x["rail_w"]:.3f},{x["switches"]},{x["switch_p95_ms"]:.3f},'
               f'{x["on_path_switch_p95_ms"]:.3f},{x["pre_release_switches"]},{x["total_switches"]},'
-              f'{x["late_switches"]},{x["goodput_jobs_s"]:.6f},{x["energy_per_on_time_mj"]}')
+              f'{x["late_switches"]},{x["goodput_jobs_s"]:.6f},{x["energy_per_on_time_mj"]},{x["hint_median_available_ms"]:.3f}')
 
 if __name__=="__main__":
     try:
