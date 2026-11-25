@@ -257,6 +257,12 @@ int main(int argc, char** argv) try {
             <<job_deadline<<','<<from<<','<<target<<','<<observed_freq<<','<<transition_ms<<','
             <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<'\n'<<std::flush;
     }
+    if(!stop && integer("--tail-idle",0)!=0) {
+        const auto horizon=start+milliseconds(static_cast<long long>(jobs)*period+
+            static_cast<long long>((jobs-1)/burst)*gap);
+        while(!stop && Clock::now()<horizon)
+            std::this_thread::sleep_until(std::min(horizon,Clock::now()+milliseconds(50)));
+    }
     if(actuator) actuator->restore();
     return 0;
 } catch(const std::exception& e) { std::cerr<<"pm_runner: "<<e.what()<<'\n'; return 1; }

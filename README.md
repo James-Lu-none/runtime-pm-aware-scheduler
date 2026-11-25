@@ -119,6 +119,10 @@ initialization in mixed policies. Fixed backend modes do not require profiles.
 
 ## Thermal / DVFS
 
+The CPU-only transition-aware controller is available in pm_runner --mode dvfs.
+Run `sudo python3 scripts/benchmark_cpu_dvfs.py` after rebuilding and generating
+CPU/transition profiles. See [controller evaluation](docs/cpu-dvfs-controller.md).
+
 Measure directed CPUFreq transition costs with `sudo python3 scripts/profile_dvfs_transition.py`.
 See [transition profiling](docs/dvfs-transition.md) for trace and readback semantics.
 
