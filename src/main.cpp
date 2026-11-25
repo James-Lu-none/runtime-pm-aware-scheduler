@@ -1,5 +1,7 @@
 #include "pm/backend.hpp"
 #include "pm/platform.hpp"
+#include "pm/dvfs.hpp"
+#include "pm/dvfs_sysfs.hpp"
 #include <chrono>
 #include <csignal>
 #include <iostream>
@@ -46,7 +48,8 @@ int main(int argc, char** argv) try {
     auto integer=[&](const std::string& k,int d){return std::stoi(get(k,std::to_string(d)));};
     auto real=[&](const std::string& k,double d){return std::stod(get(k,std::to_string(d)));};
     const std::map<std::string,pm::Mode> modes={{"cpu",pm::Mode::cpu},{"gpu",pm::Mode::gpu},{"rr",pm::Mode::rr},{"eft",pm::Mode::eft},{"energy",pm::Mode::energy},{"adaptive",pm::Mode::adaptive}};
-    auto mode=modes.at(get("--mode","cpu"));
+    const bool dvfs=get("--mode","cpu")=="dvfs";
+    auto mode=dvfs?pm::Mode::cpu:modes.at(get("--mode","cpu"));
     bool gpu=mode!=pm::Mode::cpu && integer("--gpu",1)!=0;
     if(mode==pm::Mode::gpu && !gpu) throw std::runtime_error("GPU mode requires GPU");
     std::vector<std::string> workloads;
@@ -82,6 +85,22 @@ int main(int argc, char** argv) try {
        !std::isfinite(low)||!std::isfinite(high)||low>=high||high>75||dwell<100)
         throw std::runtime_error("Invalid workload or thermal settings");
     if(budget>0 && mode!=pm::Mode::adaptive) throw std::runtime_error("Power budget requires adaptive mode");
+    std::vector<double> deadlines;
+    for(const auto& s:pm::split_csv(get("--deadlines-ms",std::to_string(deadline)))) {
+        double d=pm::number(s);
+        if(d<=0) throw std::runtime_error("Invalid per-job deadline");
+        deadlines.push_back(d);
+    }
+    if(deadlines.empty() || (deadlines.size()!=1 && deadlines.size()!=workloads.size()))
+        throw std::runtime_error("Provide one deadline or one per workload entry");
+    const double margin=real("--dvfs-margin-ms",3), saving=real("--dvfs-min-saving",.05);
+    const double switch_dwell=real("--dvfs-dwell-ms",250);
+    const int switch_timeout=integer("--dvfs-timeout-ms",100);
+    const bool ignore_switch=integer("--dvfs-ignore-transition",0)!=0;
+    if(dvfs && (pool || gap!=0 || !std::isfinite(margin)||margin<0 ||
+       !std::isfinite(saving)||saving<0||saving>=1 || !std::isfinite(switch_dwell)||switch_dwell<0 ||
+       switch_timeout<10||switch_timeout>1000))
+        throw std::runtime_error("Invalid DVFS configuration (MobileNet, fixed period, no extra gap)");
     auto costs=profile(get("--profile",""));
     if(mode==pm::Mode::eft||mode==pm::Mode::energy||mode==pm::Mode::adaptive)
         for (const auto& workload : workloads)
@@ -90,6 +109,35 @@ int main(int argc, char** argv) try {
     auto freqs=cap.frequencies();
     if(thermal && (freqs.empty() || !std::isfinite(pm::temperature(zone))))
         throw std::runtime_error("Thermal mode requires readable zone and frequency table");
+    pm::CpuCosts cpu_costs;
+    pm::SwitchCosts switches;
+    std::unique_ptr<pm::DvfsActuator> actuator;
+    std::vector<long> calibrated;
+    long thermal_ceiling=0, expected_cap=0;
+    if(dvfs) {
+        cpu_costs=pm::load_cpu_costs(get("--cpu-costs",""),threads,period);
+        switches=pm::load_switch_costs(get("--transition-costs",""),integer("--dvfs-use-max",0)!=0);
+        actuator=std::make_unique<pm::DvfsActuator>(get("--cpufreq-policy","/sys/devices/system/cpu/cpufreq/policy0"));
+        for(const auto& workload:workloads) {
+            const auto& rows=cpu_costs.at(workload);
+            std::vector<long> fs;
+            for(const auto& c:rows) {
+                if(!std::binary_search(freqs.begin(),freqs.end(),c.khz))
+                    throw std::runtime_error("Profile frequency outside current policy");
+                fs.push_back(c.khz);
+            }
+            std::sort(fs.begin(),fs.end());
+            if(calibrated.empty()) calibrated=fs;
+            else if(calibrated!=fs) throw std::runtime_error("Models need identical calibrated frequency sets");
+        }
+        if(calibrated.empty() || !std::binary_search(calibrated.begin(),calibrated.end(),actuator->initial()))
+            throw std::runtime_error("Initial cap needs a calibrated cost");
+        for(long a:calibrated) for(long b:calibrated)
+            if(!pm::switch_cost(switches,a,b)) throw std::runtime_error("Incomplete directed transition matrix");
+        thermal_ceiling=calibrated.back();
+        expected_cap=actuator->initial();
+        actuator->set_ready(expected_cap,switch_timeout);
+    }
     pm::VulkanContext vk(gpu,index);
     struct Engines { std::unique_ptr<pm::Backend> cpu, accelerator; };
     std::map<std::string, Engines> engines;
@@ -137,7 +185,8 @@ int main(int argc, char** argv) try {
     if(!rawpath.empty()) { raw.open(rawpath,std::ios::binary); if(!raw) throw std::runtime_error("Cannot open raw video"); }
     std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
     auto start=Clock::now(), last_thermal=start-milliseconds(dwell);
-    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads\n";
+    auto last_switch=start-duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
+    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms\n";
     for(int i=0;i<jobs&&!stop;++i) {
         auto release=start+milliseconds(static_cast<long long>(i)*period+static_cast<long long>(i/burst)*gap);
         while(!stop && Clock::now()<release) std::this_thread::sleep_until(std::min(release,Clock::now()+milliseconds(50)));
@@ -150,7 +199,7 @@ int main(int argc, char** argv) try {
         } else for(size_t k=0;k<frame.size();++k) frame[k]=static_cast<unsigned char>((k*17u+static_cast<unsigned>(i)*31u)%256u);
         auto now=Clock::now();
         double temp=pm::temperature(zone);
-        if(thermal && now-last_thermal>=milliseconds(dwell)) {
+        if(thermal && !dvfs && now-last_thermal>=milliseconds(dwell)) {
             if(!std::isfinite(temp)) throw std::runtime_error("Temperature unavailable");
             cap.set(pm::thermal_step(cap.current(),temp,low,high,freqs)); last_thermal=now;
         }
@@ -160,7 +209,40 @@ int main(int argc, char** argv) try {
         auto dispatch=Clock::now();
         const auto& workload=workloads[i%workloads.size()];
         auto& e=engines.at(workload);
-        auto pick=pm::select(mode,state,khz,deadline-ms(dispatch-release),budget,gpu,costs[workload],i);
+        const double job_deadline=deadlines[i%deadlines.size()];
+        const long from=khz;
+        double transition_ms=0, predicted_ms=0;
+        int predicted_feasible=-1;
+        const char* reason="fixed";
+        long target=khz, observed_freq=pm::read_long(get("--cpufreq-policy","/sys/devices/system/cpu/cpufreq/policy0")+"/scaling_cur_freq");
+        if(dvfs) {
+            actuator->validate();
+            if(khz!=expected_cap || actuator->freq()!=khz)
+                throw std::runtime_error("CPU cap/frequency drift; cannot apply calibrated transition model");
+            if(!std::isfinite(temp) || temp>=75.)
+                throw std::runtime_error("DVFS thermal guard");
+            if(thermal && now-last_thermal>=milliseconds(dwell)) {
+                thermal_ceiling=pm::thermal_step(thermal_ceiling,temp,low,high,calibrated);
+                last_thermal=now;
+            }
+            auto decision=pm::choose_dvfs(cpu_costs.at(workload),switches,khz,thermal_ceiling,
+                job_deadline-ms(Clock::now()-release),margin,ms(Clock::now()-last_switch),
+                switch_dwell,saving,ignore_switch);
+            target=decision.khz;
+            predicted_ms=decision.predicted_ms;
+            predicted_feasible=decision.feasible;
+            reason=decision.reason;
+            if(target!=khz) {
+                transition_ms=actuator->set_ready(target,switch_timeout);
+                last_switch=Clock::now();
+                expected_cap=target;
+            }
+            khz=actuator->cap();
+            observed_freq=actuator->freq();
+            if(khz!=target || observed_freq!=target)
+                throw std::runtime_error("DVFS target not observed at dispatch");
+        }
+        auto pick=pm::select(mode,state,khz,job_deadline-ms(Clock::now()-release),budget,gpu,costs[workload],i);
         double checksum=0, service=0;
         const char* status="rejected";
         if(pick.device) {
@@ -171,7 +253,10 @@ int main(int argc, char** argv) try {
         auto finish=Clock::now();
         std::cout<<std::fixed<<std::setprecision(6)<<i<<','<<ms(release-start)<<','<<ms(dispatch-start)<<','<<ms(finish-start)<<','
             <<(pick.device?pm::name(*pick.device):"none")<<','<<pm::name(state)<<','<<khz<<','<<temp<<','<<service<<','
-            <<ms(finish-release)<<','<<(!pick.device||ms(finish-release)>deadline)<<','<<status<<','<<checksum<<','<<workload<<','<<w<<','<<h<<','<<threads<<'\n'<<std::flush;
+            <<ms(finish-release)<<','<<(!pick.device||ms(finish-release)>job_deadline)<<','<<status<<','<<checksum<<','<<workload<<','<<w<<','<<h<<','<<threads<<','
+            <<job_deadline<<','<<from<<','<<target<<','<<observed_freq<<','<<transition_ms<<','
+            <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<'\n'<<std::flush;
     }
+    if(actuator) actuator->restore();
     return 0;
 } catch(const std::exception& e) { std::cerr<<"pm_runner: "<<e.what()<<'\n'; return 1; }
