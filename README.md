@@ -119,6 +119,9 @@ initialization in mixed policies. Fixed backend modes do not require profiles.
 
 ## Thermal / DVFS
 
+Measure directed CPUFreq transition costs with `sudo python3 scripts/profile_dvfs_transition.py`.
+See [transition profiling](docs/dvfs-transition.md) for trace and readback semantics.
+
 For the standalone arithmetic workload, run the automated CPUFreq sweep and
 GPU baseline: `sudo python3 scripts/profile_dvfs.py`. See
 [DVFS profiling protocol](docs/dvfs.md) for restoration, validation and Pareto CSVs.
