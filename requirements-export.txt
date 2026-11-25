@@ -1,3 +1,4 @@
 timm==1.0.15
 pnnx==20250430
 numpy<3
+huggingface_hub==0.34.4
