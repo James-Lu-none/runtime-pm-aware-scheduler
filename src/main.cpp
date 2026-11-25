@@ -2,6 +2,7 @@
 #include "pm/platform.hpp"
 #include "pm/dvfs.hpp"
 #include "pm/dvfs_sysfs.hpp"
+#include "pm/workload_trace.hpp"
 #include <chrono>
 #include <ctime>
 #include <csignal>
@@ -50,7 +51,9 @@ int main(int argc, char** argv) try {
     auto real=[&](const std::string& k,double d){return std::stod(get(k,std::to_string(d)));};
     const std::map<std::string,pm::Mode> modes={{"cpu",pm::Mode::cpu},{"gpu",pm::Mode::gpu},{"rr",pm::Mode::rr},{"eft",pm::Mode::eft},{"energy",pm::Mode::energy},{"adaptive",pm::Mode::adaptive}};
     const bool lookahead=get("--mode","cpu")=="lookahead";
-    const bool dvfs=lookahead || get("--mode","cpu")=="dvfs";
+    const bool hint=get("--mode","cpu")=="hint";
+    const bool preplanned=lookahead||hint;
+    const bool dvfs=preplanned || get("--mode","cpu")=="dvfs";
     auto mode=dvfs?pm::Mode::cpu:modes.at(get("--mode","cpu"));
     bool gpu=mode!=pm::Mode::cpu && integer("--gpu",1)!=0;
     if(mode==pm::Mode::gpu && !gpu) throw std::runtime_error("GPU mode requires GPU");
@@ -99,7 +102,21 @@ int main(int argc, char** argv) try {
     const double switch_dwell=real("--dvfs-dwell-ms",250);
     const int switch_timeout=integer("--dvfs-timeout-ms",100);
     const bool ignore_switch=integer("--dvfs-ignore-transition",0)!=0;
-    const int lead_ms=integer("--dvfs-lead-ms",150), startup_ms=integer("--startup-lead-ms",lookahead?200:0);
+    const int lead_ms=integer("--dvfs-lead-ms",150), startup_ms=integer("--startup-lead-ms",preplanned?200:0);
+    const int hint_bound=integer("--hint-lead-ms",0);
+    const bool mixed_hint=integer("--hint-mixed",0)!=0, static_hint=integer("--hint-static",0)!=0;
+    const auto replay_path=get("--workload-trace","");
+    std::vector<pm::ReplayJob> replay;
+    if(!replay_path.empty()) {
+        if(pool||gap!=0||verify||mode!=pm::Mode::cpu)
+            throw std::runtime_error("Replay requires CPU MobileNet, fixed period, no extra gap");
+        std::ifstream input(replay_path);
+        replay=pm::load_replay(input,workloads,jobs,period);
+    }
+    if(hint && (replay.empty()||hint_bound<0||hint_bound>period||hint_bound>startup_ms))
+        throw std::runtime_error("Hint mode requires replay and lead within period/startup");
+    if(!hint && (mixed_hint||static_hint))
+        throw std::runtime_error("Hint options require --mode hint");
     if((lookahead && (lead_ms<0||lead_ms>period))||startup_ms<0||startup_ms>1000)
         throw std::runtime_error("Invalid look-ahead or startup lead");
     if(dvfs && (pool || gap!=0 || !std::isfinite(margin)||margin<0 ||
@@ -213,11 +230,25 @@ int main(int argc, char** argv) try {
             last_thermal=now;
         }
     };
-    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready,release_origin_monotonic_s,clock_anchor_uncertainty_us\n";
+    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready,release_origin_monotonic_s,clock_anchor_uncertainty_us,hint_requested_lead_ms,hint_due_ms,hint_observed_ms,hint_available_lead_ms\n";
     for(int i=0;i<jobs&&!stop;++i) {
         auto release=start+milliseconds(static_cast<long long>(i)*period+static_cast<long long>(i/burst)*gap);
-        const auto& workload=workloads[i%workloads.size()];
-        const double job_deadline=deadlines[i%deadlines.size()];
+        // The replay harness knows the trace, but the hint selector only
+        // sees this job after the simulated notification has arrived.
+        int requested_notice=-1;
+        double notice_due_ms=-1,notice_observed_ms=-1,notice_available_ms=-1;
+        if(hint) {
+            requested_notice=pm::hint_lead_ms(hint_bound,replay[i].notice_token,mixed_hint);
+            const auto due=release-milliseconds(requested_notice);
+            notice_due_ms=ms(due-start);
+            sleep_to(due);
+            if(stop) break;
+            const auto observed=Clock::now();
+            notice_observed_ms=ms(observed-start);
+            notice_available_ms=std::max(0.,ms(release-observed));
+        }
+        const auto& workload=replay.empty()?workloads[i%workloads.size()]:replay[i].model;
+        const double job_deadline=replay.empty()?deadlines[i%deadlines.size()]:replay[i].deadline_ms;
         pm::ReadyResult timing;
         double switch_start_ms=0,switch_ready_ms=0,on_path_ms=0;
         int pre_ready=-1;
@@ -236,18 +267,21 @@ int main(int argc, char** argv) try {
             last_switch=after;
             expected_cap=target;
         };
-        if(lookahead) {
+        if(preplanned) {
             actuator->validate();
             planned_from=actuator->cap();
             if(planned_from!=expected_cap || actuator->freq()!=planned_from)
                 throw std::runtime_error("CPU cap/frequency drift before look-ahead");
             check_thermal(pm::temperature(zone));
             auto now=Clock::now();
-            const auto late_start=std::max(now,release-milliseconds(lead_ms));
+            // Hint mode never acts before notification. It attempts the
+            // selected transition immediately, unlike the oracle's timed upscale.
+            const auto late_start=hint?now:std::max(now,release-milliseconds(lead_ms));
             const double hidden=std::max(0.,ms(release-late_start));
             auto decision=pm::choose_dvfs(cpu_costs.at(workload),switches,planned_from,thermal_ceiling,
-                job_deadline-std::max(0.,ms(now-release)),margin,ms(late_start-last_switch),
-                switch_dwell,saving,ignore_switch,hidden);
+                static_hint?job_deadline:job_deadline-std::max(0.,ms(now-release)),
+                margin,ms(late_start-last_switch),static_hint?0.:switch_dwell,
+                static_hint?0.:saving,ignore_switch||static_hint,hidden);
             planned_target=decision.khz;
             plan_prediction=decision.predicted_ms;
             plan_feasible=decision.feasible;
@@ -259,7 +293,7 @@ int main(int argc, char** argv) try {
                     if(c.khz==planned_from && c.khz<=thermal_ceiling &&
                        c.service_ms+margin<=job_deadline-std::max(0.,ms(now-release)))
                         stay_feasible=true;
-                if(stay_feasible) {
+                if(stay_feasible && !hint) {
                     auto dwell_end=last_switch+duration_cast<Clock::duration>(duration<double,std::milli>(switch_dwell));
                     when=std::max(when,dwell_end);
                 }
@@ -298,12 +332,12 @@ int main(int argc, char** argv) try {
         if(khz<0) khz=0;
         auto dispatch=Clock::now();
         auto& e=engines.at(workload);
-        const long from=lookahead?planned_from:khz;
+        const long from=preplanned?planned_from:khz;
         double transition_ms=0, predicted_ms=0;
         int predicted_feasible=-1;
         const char* reason="fixed";
         long target=khz, observed_freq=pm::read_long(get("--cpufreq-policy","/sys/devices/system/cpu/cpufreq/policy0")+"/scaling_cur_freq");
-        if(lookahead) {
+        if(preplanned) {
             actuator->validate();
             if(!std::isfinite(temp)||temp>=75.) throw std::runtime_error("DVFS thermal guard");
             target=planned_target;
@@ -352,7 +386,8 @@ int main(int argc, char** argv) try {
             <<predicted_ms<<','<<predicted_feasible<<','<<reason<<','<<thermal_ceiling<<','<<ms(dispatch-release)<<','
             <<timing.write_ms<<','<<timing.cap_seen_ms<<','<<timing.freq_seen_ms<<','<<timing.late<<','
             <<switch_start_ms<<','<<switch_ready_ms<<','<<on_path_ms<<','<<pre_ready<<','
-            <<std::setprecision(9)<<origin_s<<','<<anchor_uncertainty_us<<'\n'<<std::flush;
+            <<std::setprecision(9)<<origin_s<<','<<anchor_uncertainty_us<<','
+            <<requested_notice<<','<<notice_due_ms<<','<<notice_observed_ms<<','<<notice_available_ms<<'\n'<<std::flush;
     }
     if(!stop && integer("--tail-idle",0)!=0) {
         const auto horizon=start+milliseconds(static_cast<long long>(jobs)*period+

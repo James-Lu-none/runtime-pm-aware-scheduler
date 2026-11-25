@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 from pathlib import Path
 import signal
 import statistics
@@ -26,6 +27,24 @@ def save(path,data):
         w=csv.DictWriter(f,fieldnames=list(data[0]))
         w.writeheader()
         w.writerows(data)
+
+def hint_spec(label):
+    for prefix in ("hint_fixed_","hint_mixed_","hint_static_"):
+        if label.startswith(prefix):
+            return prefix.split("_")[1],int(label[len(prefix):])
+    return None
+
+def dynamic_policy(label):
+    return label in ("adaptive","transition_blind","lookahead") or hint_spec(label) is not None
+
+def make_replay(models,deadlines,jobs,period,seed):
+    pairs=list(zip(models,deadlines))*(jobs//len(models))
+    rng=random.Random(seed)
+    rng.shuffle(pairs)
+    notice=random.Random(seed ^ 0x5A17B3)
+    return [dict(job=i,release_ms=i*period,model=model,deadline_ms=deadline,
+                 notice_token=notice.randint(0,1000000))
+            for i,(model,deadline) in enumerate(pairs)]
 
 def sha256(path):
     h=hashlib.sha256()
@@ -74,13 +93,14 @@ def load_profiles(a):
         print("Using transition profile with injected CPU load",flush=True)
     return cpu,trans,freqs
 
-def analyze(dest,label,repeat,a,cap):
+def analyze(dest,label,repeat,a,cap,replay=None):
     jobs=rows(dest/"jobs.csv")
     samples=rows(dest/"telemetry.csv")
     if len(jobs)!=a.jobs or any(
         int(j["job"])!=i or j["status"]!="ok" or j["backend"]!="cpu" or
-        j["workload"]!=a.models[i%len(a.models)] or int(j["threads"])!=a.threads or
-        abs(float(j["deadline_ms"])-a.deadlines[i%len(a.deadlines)])>1e-6
+        j["workload"]!=(replay[i]["model"] if replay else a.models[i%len(a.models)]) or int(j["threads"])!=a.threads or
+        abs(float(j["release_ms"])-i*a.period_ms)>1e-6 or
+        abs(float(j["deadline_ms"])-(replay[i]["deadline_ms"] if replay else a.deadlines[i%len(a.deadlines)]))>1e-6
         for i,j in enumerate(jobs)):
         raise RuntimeError(f"Incomplete or nonidentical workload: {dest}")
     if len(samples)<2 or any(not s[k] for s in samples for k in
@@ -105,7 +125,24 @@ def analyze(dest,label,repeat,a,cap):
     pre_ready=sum(int(j["pre_release_ready"])==1 for j in changes)
     on_path=[float(j["transition_on_path_ms"]) for j in changes]
     on_time=len(jobs)-misses
-    dynamic=label in ("adaptive","transition_blind","lookahead")
+    dynamic=dynamic_policy(label)
+    hint=hint_spec(label)
+    effective_leads=[]
+    if hint:
+        kind,bound=hint
+        for i,j in enumerate(jobs):
+            expected=bound*replay[i]["notice_token"]//1000000 if kind=="mixed" else bound
+            requested=int(j["hint_requested_lead_ms"])
+            due=float(j["hint_due_ms"])
+            observed=float(j["hint_observed_ms"])
+            available=float(j["hint_available_lead_ms"])
+            release=float(j["release_ms"])
+            if (requested!=expected or abs(due-(release-expected))>1e-4 or
+                observed<due-1e-4 or abs(available-max(0,release-observed))>1e-4 or
+                (int(j["from_khz"])!=int(j["target_khz"]) and
+                 float(j["transition_start_ms"])<observed-1e-4)):
+                raise RuntimeError(f"Hint timing/reveal violation: {dest} job {i}")
+            effective_leads.append(available)
     if dynamic:
         valid_caps=all(int(j["cap_khz"])==int(j["target_khz"])==int(j["reported_freq_khz"]) for j in jobs)
     else:
@@ -117,6 +154,9 @@ def analyze(dest,label,repeat,a,cap):
     telemetry=json.loads((dest/"telemetry_metadata.json").read_text())
     trace_valid=(not telemetry["trace_requested"]) or telemetry.get("trace_overrun") is False
     result=dict(policy=label,repeat=repeat,jobs=len(jobs),misses=misses,
+        hint_kind=hint[0] if hint else "",hint_bound_ms=hint[1] if hint else -1,
+        hint_median_available_ms=statistics.median(effective_leads) if effective_leads else -1,
+        hint_late_observations=sum(float(j["hint_observed_ms"])>float(j["release_ms"])+.1 for j in jobs) if hint else 0,
         telemetry_mode=telemetry["mode"],pmic_samples=telemetry["pmic"]["samples"],
         pmic_median_gap_ms=telemetry["pmic"]["median_gap_ms"],
         pmic_p95_gap_ms=telemetry["pmic"]["p95_gap_ms"],
@@ -166,11 +206,16 @@ def main():
     p.add_argument("--lead-ms",type=int,default=150,help="Look-ahead upscale lead")
     p.add_argument("--startup-lead-ms",type=int,default=200,help="Same initial release offset for all policies")
     p.add_argument("--lookahead-only",action="store_true",help="Only run V2 for a smoke test")
+    p.add_argument("--hint-sweep",nargs="+",type=int,metavar="MS",
+                   help="Randomized replay: compare native, oracle, and fixed hint leads")
+    p.add_argument("--hint-mixed-ms",type=int,help="Add randomized 0..MS notice arm")
+    p.add_argument("--hint-static-ms",type=int,help="Add static per-class frequency map with this notice lead")
+    p.add_argument("--replay-seed",type=int,default=42)
     p.add_argument("--telemetry",choices=["legacy","multi"],default="multi")
-    p.add_argument("--freq-ms",type=int,default=5)
-    p.add_argument("--pmic-ms",type=int,default=30)
+    p.add_argument("--freq-ms",type=int,default=500)
+    p.add_argument("--pmic-ms",type=int,default=137)
     p.add_argument("--temp-ms",type=int,default=500)
-    p.add_argument("--idle-ms",type=int,default=100)
+    p.add_argument("--idle-ms",type=int,default=1000)
     p.add_argument("--trace-buffer-kb",type=int,default=8192)
     p.add_argument("--no-frequency-trace",action="store_true")
     p.add_argument("--observer-check",action="store_true",
@@ -190,6 +235,14 @@ def main():
     p.add_argument("--runner",type=Path,default=ROOT/"build/pm_runner")
     p.add_argument("--out",type=Path,default=ROOT/("results/cpu-dvfs-"+time.strftime("%Y%m%d-%H%M%S")))
     a=p.parse_args()
+    if a.hint_sweep is not None:
+        leads=a.hint_sweep+[v for v in (a.hint_mixed_ms,a.hint_static_ms) if v is not None]
+        if (a.observer_check or a.lookahead_only or a.ablation or a.thermal or
+            len(set(a.hint_sweep))!=len(a.hint_sweep) or
+            any(v<0 or v>min(a.period_ms,a.startup_lead_ms) for v in leads)):
+            p.error("Hint sweep needs distinct leads within period/startup, without other experiment modes or thermal")
+    elif a.hint_mixed_ms is not None or a.hint_static_ms is not None:
+        p.error("Mixed/static hints require --hint-sweep")
     if a.observer_check and a.lookahead_only:
         p.error("--observer-check and --lookahead-only are mutually exclusive")
     if not (1<=a.freq_ms<=10000 and 30<=a.pmic_ms<=10000 and
@@ -238,7 +291,24 @@ def sweep(a,cpu,trans,freqs):
         configs=[x for x in configs if x[0]=="lookahead"]
     if a.observer_check:
         configs=[("observer_legacy",orig_gov,orig_cap),("observer_multi",orig_gov,orig_cap)]
+    if a.hint_sweep is not None:
+        configs=[(g,g,orig_cap) for g in native]
+        configs.append(("lookahead","performance",orig_cap))
+        configs.extend((f"hint_fixed_{v}","performance",orig_cap) for v in a.hint_sweep)
+        if a.hint_mixed_ms is not None:
+            configs.append((f"hint_mixed_{a.hint_mixed_ms}","performance",orig_cap))
+        if a.hint_static_ms is not None:
+            configs.append((f"hint_static_{a.hint_static_ms}","performance",orig_cap))
     a.out.mkdir(parents=True,exist_ok=False)
+    replay_paths={}
+    replay_data={}
+    if a.hint_sweep is not None:
+        for repeat in range(1,a.repeats+1):
+            replay=make_replay(a.models,a.deadlines,a.jobs,a.period_ms,a.replay_seed+repeat-1)
+            path=a.out/f"replay-r{repeat}.csv"
+            save(path,replay)
+            replay_paths[repeat]=path
+            replay_data[repeat]=replay
     meta=dict(policy=str(a.policy),governor=orig_gov,min_khz=orig_min,max_khz=orig_cap,
               cpu_profile=str(cpu),transition_profile=str(trans),configs=configs,
               cpu_costs_sha256=sha256(cpu/"cpu_costs.csv"),
@@ -248,6 +318,8 @@ def sweep(a,cpu,trans,freqs):
               margin_ms=a.margin_ms,dwell_ms=a.dwell_ms,min_saving=a.min_saving,use_max=a.use_max,
               thermal=a.thermal,thermal_low=a.thermal_low,thermal_high=a.thermal_high,
               lead_ms=a.lead_ms,startup_lead_ms=a.startup_lead_ms,
+              hint_sweep=a.hint_sweep,hint_mixed_ms=a.hint_mixed_ms,hint_static_ms=a.hint_static_ms,
+              replay_seed=a.replay_seed,replay_sha256={str(k):sha256(v) for k,v in replay_paths.items()},
               telemetry=a.telemetry,observer_check=a.observer_check,
               freq_ms=a.freq_ms,pmic_ms=a.pmic_ms,temp_ms=a.temp_ms,idle_ms=a.idle_ms,
               trace_frequency=not a.no_frequency_trace,trace_buffer_kb=a.trace_buffer_kb,
@@ -269,7 +341,8 @@ def sweep(a,cpu,trans,freqs):
                 if int(read(minfile))!=orig_min:
                     raise RuntimeError("CPUFreq minimum changed")
                 dest=a.out/f"r{repeat}-{label}"
-                dynamic=label in ("adaptive","transition_blind","lookahead")
+                dynamic=dynamic_policy(label)
+                hint=hint_spec(label)
                 telemetry=("legacy" if label=="observer_legacy" else "multi") if a.observer_check else a.telemetry
                 collector=["--telemetry",telemetry,"--freq-ms",str(a.freq_ms),"--pmic-ms",str(a.pmic_ms),
                            "--temp-ms",str(a.temp_ms),"--idle-ms",str(a.idle_ms),
@@ -278,7 +351,7 @@ def sweep(a,cpu,trans,freqs):
                     collector.append("--trace-frequency")
                 cmd=[sys.executable,str(ROOT/"scripts/run.py"),"--out",str(dest),
                      "--policy",str(a.policy),"--zone",str(a.zone),"--interval","0.137",
-                     *collector,"--",str(a.runner),"--mode","lookahead" if label=="lookahead" else ("dvfs" if dynamic else "cpu"),
+                     *collector,"--",str(a.runner),"--mode","hint" if hint else ("lookahead" if label=="lookahead" else ("dvfs" if dynamic else "cpu")),
                      "--gpu","0","--workload",",".join(a.models),"--model-dir",str(a.model_dir),
                      "--threads",str(a.threads),"--jobs",str(a.jobs),"--period-ms",str(a.period_ms),
                      "--deadlines-ms",",".join(map(str,a.deadlines)),"--tail-idle","1",
@@ -286,6 +359,12 @@ def sweep(a,cpu,trans,freqs):
                      "--cpufreq-policy",str(a.policy),"--thermal-zone",str(a.zone),
                      "--thermal","1" if dynamic and a.thermal else "0",
                      "--thermal-low",str(a.thermal_low),"--thermal-high",str(a.thermal_high)]
+                if repeat in replay_paths:
+                    cmd+=["--workload-trace",str(replay_paths[repeat])]
+                if hint:
+                    kind,bound=hint
+                    cmd+=["--hint-lead-ms",str(bound),"--hint-mixed",str(int(kind=="mixed")),
+                          "--hint-static",str(int(kind=="static"))]
                 if dynamic:
                     cmd+=["--cpu-costs",str(cpu/"cpu_costs.csv"),"--transition-costs",str(trans/"transition_costs.csv"),
                           "--dvfs-margin-ms",str(a.margin_ms),"--dvfs-dwell-ms",str(a.dwell_ms),
@@ -296,7 +375,7 @@ def sweep(a,cpu,trans,freqs):
                 run_checked(cmd,env,a.zone,a.max_temp,a.out/f"{dest.name}.stderr.log")
                 if int(read(capfile))!=cap or read(govfile)!=gov or int(read(minfile))!=orig_min:
                     raise RuntimeError("CPUFreq settings not restored by runner or external change")
-                result=analyze(dest,label,repeat,a,cap)
+                result=analyze(dest,label,repeat,a,cap,replay_data.get(repeat))
                 results.append(result)
                 save(a.out/"runs.csv",results)
                 print(f'{label}: misses={result["misses"]}/{result["jobs"]}, '
@@ -325,6 +404,10 @@ def sweep(a,cpu,trans,freqs):
         x["miss_pct"]=100*x["misses"]/x["jobs"]
         for key in ("p95_response_ms","p99_response_ms","rail_w","approx_energy_mj_job","switches","switch_p95_ms","on_path_switch_p95_ms"):
             x[key]=statistics.median(g[key] for g in group)
+        x["hint_kind"]=group[0]["hint_kind"]
+        x["hint_bound_ms"]=group[0]["hint_bound_ms"]
+        x["hint_median_available_ms"]=statistics.median(g["hint_median_available_ms"] for g in group)
+        x["hint_late_observations"]=sum(g["hint_late_observations"] for g in group)
         x["telemetry_mode"]=group[0]["telemetry_mode"]
         x["pmic_median_gap_ms"]=statistics.median(g["pmic_median_gap_ms"] for g in group)
         x["trace_valid"]=int(all(g["trace_valid"] for g in group))

@@ -86,3 +86,7 @@ Use the same thermal settings and arrival pattern when comparing policies. Therm
 ## Telemetry protocol
 
 The evaluation defaults to [multi-rate telemetry](telemetry.md). Run the observer check before a long sweep; use --telemetry legacy for the prior 137 ms protocol.
+
+## Limited application hints
+
+See [randomized hint replay](hint-replay.md) for the lead-time sweep and static-map baseline.

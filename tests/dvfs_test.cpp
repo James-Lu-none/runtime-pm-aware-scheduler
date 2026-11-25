@@ -1,5 +1,6 @@
 #include "pm/dvfs.hpp"
 #include "pm/dvfs_sysfs.hpp"
+#include "pm/workload_trace.hpp"
 #include <iostream>
 #include <cstdlib>
 using namespace pm;
@@ -36,4 +37,14 @@ int main() {
     check(choose_dvfs(large,sw,a,b,68,3,1000,250,.05,false,150).khz==b,
           "look-ahead respects ceiling");
     check(!ready_late(100,100)&&ready_late(126.739,100),"late readback not on-time success");
+    check(hint_lead_ms(150,500000,true)==75,"mixed notice");
+    check(hint_lead_ms(150,0,false)==150,"fixed notice ignores token");
+    check(hint_lead_ms(0,1000000,true)==0,"zero notice");
+    std::istringstream trace("job,release_ms,model,deadline_ms,notice_token\n0,0,small,18,0\n1,500,large,68,1000000\n");
+    auto replay=load_replay(trace,{"small","large"},2,500);
+    check(replay.size()==2&&replay[1].model=="large"&&replay[1].deadline_ms==68,"valid replay");
+    std::istringstream invalid("job,release_ms,model,deadline_ms,notice_token\n0,1,small,18,0\n");
+    bool rejected=false;
+    try {load_replay(invalid,{"small"},1,500);} catch(const std::runtime_error&) {rejected=true;}
+    check(rejected,"invalid replay release rejected");
 }
