@@ -3,6 +3,7 @@
 #include "pm/dvfs.hpp"
 #include "pm/dvfs_sysfs.hpp"
 #include "pm/workload_trace.hpp"
+#include "pm/thermal_supervisor.hpp"
 #include <chrono>
 #include <ctime>
 #include <csignal>
@@ -83,6 +84,10 @@ int main(int argc, char** argv) try {
     if (!pool && (args.count("--param") || args.count("--bin")))
         throw std::runtime_error("Use --model-dir for MobileNetV4");
     const bool thermal=integer("--thermal",0)!=0;
+    const bool supervise=integer("--thermal-supervisor",0)!=0;
+    const double thermal_tau=real("--thermal-tau-s",1.), thermal_slope=real("--thermal-slope-c-s",.5);
+    const double supervisor_dwell=real("--supervisor-dwell-s",2.);
+    if(supervise && (!hint||thermal)) throw std::runtime_error("Thermal supervisor requires hint mode without legacy thermal");
     const double low=real("--thermal-low",65), high=real("--thermal-high",70);
     const int dwell=integer("--thermal-dwell-ms",1000);
     if(w<=0||h<=0||w>4096||h>4096||jobs<=0||period<=0||burst<=0||gap<0||threads<=0||
@@ -160,6 +165,9 @@ int main(int argc, char** argv) try {
         expected_cap=actuator->initial();
         actuator->set_ready(expected_cap,switch_timeout);
     }
+    std::unique_ptr<pm::ThermalSupervisor> supervisor;
+    if(supervise) supervisor=std::make_unique<pm::ThermalSupervisor>(
+        calibrated,low,high,thermal_tau,thermal_slope,supervisor_dwell);
     pm::VulkanContext vk(gpu,index);
     struct Engines { std::unique_ptr<pm::Backend> cpu, accelerator; };
     std::map<std::string, Engines> engines;
@@ -230,7 +238,7 @@ int main(int argc, char** argv) try {
             last_thermal=now;
         }
     };
-    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready,release_origin_monotonic_s,clock_anchor_uncertainty_us,hint_requested_lead_ms,hint_due_ms,hint_observed_ms,hint_available_lead_ms\n";
+    std::cout<<"job,release_ms,dispatch_ms,finish_ms,backend,gpu_state,cap_khz,temp_c,service_ms,response_ms,deadline_miss,status,checksum,workload,width,height,threads,deadline_ms,from_khz,target_khz,reported_freq_khz,transition_ms,predicted_ms,predicted_feasible,decision,thermal_ceiling_khz,queue_ms,transition_write_ms,transition_cap_seen_ms,transition_freq_seen_ms,transition_late,transition_start_ms,transition_ready_ms,transition_on_path_ms,pre_release_ready,release_origin_monotonic_s,clock_anchor_uncertainty_us,hint_requested_lead_ms,hint_due_ms,hint_observed_ms,hint_available_lead_ms,thermal_hint_temp_c,thermal_ema_c,thermal_slope_c_s,thermal_action,unconstrained_target_khz,thermal_binding\n";
     for(int i=0;i<jobs&&!stop;++i) {
         auto release=start+milliseconds(static_cast<long long>(i)*period+static_cast<long long>(i/burst)*gap);
         // The replay harness knows the trace, but the hint selector only
@@ -252,7 +260,9 @@ int main(int argc, char** argv) try {
         pm::ReadyResult timing;
         double switch_start_ms=0,switch_ready_ms=0,on_path_ms=0;
         int pre_ready=-1;
-        long planned_from=0, planned_target=0;
+        long planned_from=0, planned_target=0, unconstrained_target=0;
+        double hint_temp=-1, thermal_ema=-1, thermal_rate=0;
+        const char* thermal_action="off";
         double plan_prediction=0;
         int plan_feasible=-1;
         const char* plan_reason="fixed";
@@ -272,7 +282,14 @@ int main(int argc, char** argv) try {
             planned_from=actuator->cap();
             if(planned_from!=expected_cap || actuator->freq()!=planned_from)
                 throw std::runtime_error("CPU cap/frequency drift before look-ahead");
-            check_thermal(pm::temperature(zone));
+            hint_temp=pm::temperature(zone);
+            check_thermal(hint_temp);
+            if(supervisor) {
+                thermal_ceiling=supervisor->update(ms(Clock::now()-start)/1000.,hint_temp);
+                thermal_ema=supervisor->ema();
+                thermal_rate=supervisor->slope();
+                thermal_action=supervisor->reason();
+            }
             auto now=Clock::now();
             // Hint mode never acts before notification. It attempts the
             // selected transition immediately, unlike the oracle's timed upscale.
@@ -282,6 +299,13 @@ int main(int argc, char** argv) try {
                 static_hint?job_deadline:job_deadline-std::max(0.,ms(now-release)),
                 margin,ms(late_start-last_switch),static_hint?0.:switch_dwell,
                 static_hint?0.:saving,ignore_switch||static_hint,hidden);
+            // Counterfactual with the same current state, not a second action.
+            // Record whether the ceiling actually excludes the preferred target.
+            unconstrained_target=thermal_ceiling==calibrated.back()?decision.khz:
+                pm::choose_dvfs(cpu_costs.at(workload),switches,planned_from,calibrated.back(),
+                    static_hint?job_deadline:job_deadline-std::max(0.,ms(now-release)),
+                    margin,ms(late_start-last_switch),static_hint?0.:switch_dwell,
+                    static_hint?0.:saving,ignore_switch||static_hint,hidden).khz;
             planned_target=decision.khz;
             plan_prediction=decision.predicted_ms;
             plan_feasible=decision.feasible;
@@ -347,7 +371,7 @@ int main(int argc, char** argv) try {
             transition_ms=timing.elapsed_ms;
             khz=actuator->cap();
             observed_freq=actuator->freq();
-            if(khz!=target || observed_freq!=target || khz!=expected_cap)
+            if(khz!=target || observed_freq!=target || khz!=expected_cap || (supervise && target>thermal_ceiling))
                 throw std::runtime_error("Look-ahead target not observed at dispatch");
         } else if(dvfs) {
             actuator->validate();
@@ -387,7 +411,9 @@ int main(int argc, char** argv) try {
             <<timing.write_ms<<','<<timing.cap_seen_ms<<','<<timing.freq_seen_ms<<','<<timing.late<<','
             <<switch_start_ms<<','<<switch_ready_ms<<','<<on_path_ms<<','<<pre_ready<<','
             <<std::setprecision(9)<<origin_s<<','<<anchor_uncertainty_us<<','
-            <<requested_notice<<','<<notice_due_ms<<','<<notice_observed_ms<<','<<notice_available_ms<<'\n'<<std::flush;
+            <<requested_notice<<','<<notice_due_ms<<','<<notice_observed_ms<<','<<notice_available_ms<<','
+            <<hint_temp<<','<<thermal_ema<<','<<thermal_rate<<','<<thermal_action<<','
+            <<unconstrained_target<<','<<(supervise && unconstrained_target>thermal_ceiling)<<'\n'<<std::flush;
     }
     if(!stop && integer("--tail-idle",0)!=0) {
         const auto horizon=start+milliseconds(static_cast<long long>(jobs)*period+

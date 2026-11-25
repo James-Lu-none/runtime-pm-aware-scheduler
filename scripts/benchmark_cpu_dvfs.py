@@ -11,6 +11,8 @@ import random
 from pathlib import Path
 import signal
 import statistics
+import shutil
+import subprocess
 import sys
 import time
 
@@ -29,6 +31,10 @@ def save(path,data):
         w.writerows(data)
 
 def hint_spec(label):
+    for prefix,kind in (("thermal_static_","static_mixed"),("thermal_dynamic_","mixed"),
+                        ("thermal_off_","mixed")):
+        if label.startswith(prefix):
+            return kind,int(label[len(prefix):])
     for prefix in ("hint_fixed_","hint_mixed_","hint_static_"):
         if label.startswith(prefix):
             return prefix.split("_")[1],int(label[len(prefix):])
@@ -131,7 +137,7 @@ def analyze(dest,label,repeat,a,cap,replay=None):
     if hint:
         kind,bound=hint
         for i,j in enumerate(jobs):
-            expected=bound*replay[i]["notice_token"]//1000000 if kind=="mixed" else bound
+            expected=bound*replay[i]["notice_token"]//1000000 if kind in ("mixed","static_mixed") else bound
             requested=int(j["hint_requested_lead_ms"])
             due=float(j["hint_due_ms"])
             observed=float(j["hint_observed_ms"])
@@ -176,6 +182,43 @@ def analyze(dest,label,repeat,a,cap,replay=None):
         predicted_infeasible=sum(j["predicted_feasible"]=="0" for j in jobs) if dynamic else 0,
         max_temp_c=max(int(s["temp_mc"])/1000 for s in samples),
         valid=int(valid),run_dir=str(dest))
+    if a.thermal_compare:
+        supervised=not label.startswith("thermal_off_")
+        hints=[float(j["thermal_hint_temp_c"]) for j in jobs]
+        ceilings=[int(j["thermal_ceiling_khz"]) for j in jobs]
+        if any(not math.isfinite(v) or v<0 for v in hints) or any(
+                int(j["target_khz"])>c for j,c in zip(jobs,ceilings)):
+            raise RuntimeError(f"Invalid thermal state or target above ceiling: {dest}")
+        binding=sum(int(j["thermal_binding"]) for j in jobs)
+        result.update(first_hint_temp_c=hints[0],thermal_binding_jobs=binding,
+                      thermal_limited_jobs=sum(c<cap for c in ceilings),
+                      thermal_binding_misses=sum(int(j["deadline_miss"]) for j in jobs if int(j["thermal_binding"])),
+                      thermal_rising_actions=sum(j["thermal_action"]=="rising" for j in jobs),
+                      thermal_ceiling_changes=sum(x!=y for x,y in zip([cap]+ceilings,ceilings)),
+                      thermal_above_high_jobs=sum(v>=a.thermal_high for v in hints),
+                      thermal_pressure_observed=int(binding>0) if supervised else int(any(v>=a.thermal_high for v in hints)))
+        # Integrate time above the soft threshold from the independent
+        # temperature stream, with linear interpolation; not a safety guarantee.
+        ts=rows(dest/"temperature.csv") if (dest/"temperature.csv").is_file() else []
+        if not ts:
+            ts=samples
+        ttemp=[(float(x["monotonic_s"]),float(x["temp_mc"])/1000) for x in ts]
+        result["max_temp_c"]=max(v for _,v in ttemp)
+        excess=0.
+        above=0.
+        for (t0,v0),(t1,v1) in zip(ttemp,ttemp[1:]):
+            if t1<=t0:
+                raise RuntimeError("Nonmonotonic temperature telemetry")
+            x,y=v0-a.thermal_high,v1-a.thermal_high
+            dt=t1-t0
+            if x>=0 and y>=0:
+                above+=dt if max(x,y)>0 else 0.
+                excess+=dt*(x+y)/2
+            elif max(x,y)>0:
+                portion=dt*max(x,y)/abs(y-x)
+                above+=portion
+                excess+=portion*max(x,y)/2
+        result.update(thermal_above_high_s=above,thermal_excess_c_s=excess)
     # Keep deadline outcomes by workload/deadline; pooled latency alone hides
     # misses in tight jobs.
     groups={}
@@ -189,6 +232,35 @@ def analyze(dest,label,repeat,a,cap,replay=None):
             p95_response_ms=percentile(times,.95),max_response_ms=max(times)))
     save(dest/"by_deadline.csv",details)
     return result
+
+def preheat(a,log_path):
+    """Warm the board before collection; no stress worker during inference."""
+    if not shutil.which("stress-ng"):
+        raise RuntimeError("Install stress-ng for thermal comparison")
+    from profile_dvfs import stop_child
+    begin=time.monotonic()
+    with log_path.open("w") as f:
+        f.write("elapsed_s,temp_c\n")
+        f.flush()
+        child=subprocess.Popen(["stress-ng","--cpu","4","--cpu-method","matrixprod",
+                                "--timeout",f"{a.preheat_timeout_s+5}s","--quiet"],
+                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+        try:
+            while True:
+                temp=int(read(a.zone/"temp"))/1000
+                elapsed=time.monotonic()-begin
+                f.write(f"{elapsed:.3f},{temp:.3f}\n")
+                f.flush()
+                if temp>=a.max_temp:
+                    raise RuntimeError("Preheat thermal guard reached")
+                if temp>=a.preheat_temp:
+                    return temp
+                if elapsed>=a.preheat_timeout_s or child.poll() is not None:
+                    raise RuntimeError("Preheat target not reached; inspect preheat CSV, adjust soft thresholds (keep cooler)")
+                time.sleep(.25)
+        finally:
+            stop_child(child)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -225,6 +297,14 @@ def main():
     p.add_argument("--min-saving",type=float,default=.05)
     p.add_argument("--use-max",action="store_true")
     p.add_argument("--thermal",action="store_true",help="Enable adaptive software thermal ceiling")
+    p.add_argument("--thermal-compare",action="store_true",
+                   help="Three matched mixed-hint arms: static+supervisor, dynamic+supervisor, dynamic without supervisor")
+    p.add_argument("--thermal-hint-ms",type=int,default=25)
+    p.add_argument("--thermal-tau-s",type=float,default=1.)
+    p.add_argument("--thermal-slope-c-s",type=float,default=.5)
+    p.add_argument("--supervisor-dwell-s",type=float,default=2.)
+    p.add_argument("--preheat-temp",type=float,default=54.)
+    p.add_argument("--preheat-timeout-s",type=int,default=120)
     p.add_argument("--thermal-low",type=float,default=55)
     p.add_argument("--thermal-high",type=float,default=60)
     p.add_argument("--start-temp",type=float,default=60)
@@ -235,6 +315,15 @@ def main():
     p.add_argument("--runner",type=Path,default=ROOT/"build/pm_runner")
     p.add_argument("--out",type=Path,default=ROOT/("results/cpu-dvfs-"+time.strftime("%Y%m%d-%H%M%S")))
     a=p.parse_args()
+    if a.thermal_compare:
+        if (a.hint_sweep is not None or a.observer_check or a.lookahead_only or a.ablation or a.thermal
+            or a.hint_mixed_ms is not None or a.hint_static_ms is not None or
+            not 0<=a.thermal_hint_ms<=min(a.period_ms,a.startup_lead_ms) or
+            not 0<a.start_temp<=a.thermal_low<a.thermal_high<a.preheat_temp<a.max_temp<=75 or
+            not all(math.isfinite(v) and v>0 for v in
+                    (a.thermal_tau_s,a.thermal_slope_c_s,a.supervisor_dwell_s)) or
+            not 10<=a.preheat_timeout_s<=300 or a.threads!=4):
+            p.error("Thermal compare requires exclusive mode, 4 threads, start<=low<high<preheat<guard")
     if a.hint_sweep is not None:
         leads=a.hint_sweep+[v for v in (a.hint_mixed_ms,a.hint_static_ms) if v is not None]
         if (a.observer_check or a.lookahead_only or a.ablation or a.thermal or
@@ -299,10 +388,13 @@ def sweep(a,cpu,trans,freqs):
             configs.append((f"hint_mixed_{a.hint_mixed_ms}","performance",orig_cap))
         if a.hint_static_ms is not None:
             configs.append((f"hint_static_{a.hint_static_ms}","performance",orig_cap))
+    if a.thermal_compare:
+        configs=[(f"thermal_{kind}_{a.thermal_hint_ms}","performance",orig_cap)
+                 for kind in ("off","static","dynamic")]
     a.out.mkdir(parents=True,exist_ok=False)
     replay_paths={}
     replay_data={}
-    if a.hint_sweep is not None:
+    if a.hint_sweep is not None or a.thermal_compare:
         for repeat in range(1,a.repeats+1):
             replay=make_replay(a.models,a.deadlines,a.jobs,a.period_ms,a.replay_seed+repeat-1)
             path=a.out/f"replay-r{repeat}.csv"
@@ -317,6 +409,10 @@ def sweep(a,cpu,trans,freqs):
               jobs=a.jobs,period_ms=a.period_ms,threads=a.threads,repeats=a.repeats,
               margin_ms=a.margin_ms,dwell_ms=a.dwell_ms,min_saving=a.min_saving,use_max=a.use_max,
               thermal=a.thermal,thermal_low=a.thermal_low,thermal_high=a.thermal_high,
+              thermal_compare=a.thermal_compare,thermal_hint_ms=a.thermal_hint_ms,
+              thermal_tau_s=a.thermal_tau_s,thermal_slope_c_s=a.thermal_slope_c_s,
+              supervisor_dwell_s=a.supervisor_dwell_s,preheat_temp=a.preheat_temp,
+              preheat_timeout_s=a.preheat_timeout_s,
               lead_ms=a.lead_ms,startup_lead_ms=a.startup_lead_ms,
               hint_sweep=a.hint_sweep,hint_mixed_ms=a.hint_mixed_ms,hint_static_ms=a.hint_static_ms,
               replay_seed=a.replay_seed,replay_sha256={str(k):sha256(v) for k,v in replay_paths.items()},
@@ -341,6 +437,9 @@ def sweep(a,cpu,trans,freqs):
                 if int(read(minfile))!=orig_min:
                     raise RuntimeError("CPUFreq minimum changed")
                 dest=a.out/f"r{repeat}-{label}"
+                preheat_end=-1.
+                if a.thermal_compare:
+                    preheat_end=preheat(a,a.out/f"{dest.name}.preheat.csv")
                 dynamic=dynamic_policy(label)
                 hint=hint_spec(label)
                 telemetry=("legacy" if label=="observer_legacy" else "multi") if a.observer_check else a.telemetry
@@ -363,8 +462,12 @@ def sweep(a,cpu,trans,freqs):
                     cmd+=["--workload-trace",str(replay_paths[repeat])]
                 if hint:
                     kind,bound=hint
-                    cmd+=["--hint-lead-ms",str(bound),"--hint-mixed",str(int(kind=="mixed")),
-                          "--hint-static",str(int(kind=="static"))]
+                    cmd+=["--hint-lead-ms",str(bound),"--hint-mixed",str(int(kind in ("mixed","static_mixed"))),
+                          "--hint-static",str(int(kind in ("static","static_mixed")))]
+                if a.thermal_compare and not label.startswith("thermal_off_"):
+                    cmd+=["--thermal-supervisor","1","--thermal-tau-s",str(a.thermal_tau_s),
+                          "--thermal-slope-c-s",str(a.thermal_slope_c_s),
+                          "--supervisor-dwell-s",str(a.supervisor_dwell_s)]
                 if dynamic:
                     cmd+=["--cpu-costs",str(cpu/"cpu_costs.csv"),"--transition-costs",str(trans/"transition_costs.csv"),
                           "--dvfs-margin-ms",str(a.margin_ms),"--dvfs-dwell-ms",str(a.dwell_ms),
@@ -376,6 +479,7 @@ def sweep(a,cpu,trans,freqs):
                 if int(read(capfile))!=cap or read(govfile)!=gov or int(read(minfile))!=orig_min:
                     raise RuntimeError("CPUFreq settings not restored by runner or external change")
                 result=analyze(dest,label,repeat,a,cap,replay_data.get(repeat))
+                result["preheat_end_c"]=preheat_end
                 results.append(result)
                 save(a.out/"runs.csv",results)
                 print(f'{label}: misses={result["misses"]}/{result["jobs"]}, '
@@ -416,6 +520,14 @@ def sweep(a,cpu,trans,freqs):
         x["total_switches"]=sum(g["switches"] for g in group)
         x["goodput_jobs_s"]=(x["jobs"]-x["misses"])/(x["jobs"]*a.period_ms/1000)
         x["energy_per_on_time_mj"]=1000*sum(g["approx_energy_j"] for g in group)/(x["jobs"]-x["misses"]) if x["jobs"]>x["misses"] else None
+        if a.thermal_compare:
+            for key in ("thermal_binding_jobs","thermal_binding_misses","thermal_limited_jobs",
+                        "thermal_ceiling_changes","thermal_rising_actions","thermal_above_high_jobs",
+                        "thermal_pressure_observed"):
+                x[key]=sum(g[key] for g in group)
+            for key in ("first_hint_temp_c","preheat_end_c","thermal_above_high_s","thermal_excess_c_s"):
+                x[key]=statistics.median(g[key] for g in group)
+            x["max_temp_c"]=max(g["max_temp_c"] for g in group)
         summary.append(x)
     if not summary:
         raise RuntimeError("No valid configurations")
@@ -426,6 +538,16 @@ def sweep(a,cpu,trans,freqs):
               f'{x["approx_energy_mj_job"]:.3f},{x["rail_w"]:.3f},{x["switches"]},{x["switch_p95_ms"]:.3f},'
               f'{x["on_path_switch_p95_ms"]:.3f},{x["pre_release_switches"]},{x["total_switches"]},'
               f'{x["late_switches"]},{x["goodput_jobs_s"]:.6f},{x["energy_per_on_time_mj"]},{x["hint_median_available_ms"]:.3f}')
+
+    if a.thermal_compare:
+        print("\npolicy,binding_jobs,limited_jobs,binding_misses,ceiling_changes,rising_actions,pressure_runs,first_hint_c,max_temp_c,above_high_s,excess_c_s")
+        for x in summary:
+            print(",".join(str(x[k]) for k in ("policy","thermal_binding_jobs","thermal_limited_jobs",
+                  "thermal_binding_misses","thermal_ceiling_changes","thermal_rising_actions",
+                  "thermal_pressure_observed","first_hint_temp_c","max_temp_c",
+                  "thermal_above_high_s","thermal_excess_c_s")))
+        if any(x["thermal_pressure_observed"]<a.repeats for x in summary):
+            print("WARNING: thermal pressure was not observed in every run; inspect binding counts before interpreting",file=sys.stderr)
 
 if __name__=="__main__":
     try:

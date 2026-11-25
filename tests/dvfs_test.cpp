@@ -1,6 +1,7 @@
 #include "pm/dvfs.hpp"
 #include "pm/dvfs_sysfs.hpp"
 #include "pm/workload_trace.hpp"
+#include "pm/thermal_supervisor.hpp"
 #include <iostream>
 #include <cstdlib>
 using namespace pm;
@@ -47,4 +48,16 @@ int main() {
     bool rejected=false;
     try {load_replay(invalid,{"small"},1,500);} catch(const std::runtime_error&) {rejected=true;}
     check(rejected,"invalid replay release rejected");
+    ThermalSupervisor therm({a,b,c},48,51,1.,.5,2.);
+    check(therm.update(0,54)==a,"hot first observation forces lowest ceiling");
+    check(therm.update(.5,47)==a,"EMA/dwell prevent immediate recovery");
+    for(int i=2;i<=12;++i) therm.update(i*.5,47);
+    check(therm.ceiling()==c,"cooling restores ceiling in steps");
+    check(therm.update(6.5,53)==a,"hot override ignores recovery dwell");
+    ThermalSupervisor rise({a,b,c},48,60,.5,.5,2.);
+    for(int i=0;i<=10;++i) rise.update(i*.5,48+i*.5);
+    check(rise.ceiling()<c,"confirmed positive thermal derivative constrains ceiling");
+    check(rise.update(10,50)<=c&&rise.slope()==0,"long sample gap resets derivative");
+    auto restricted=choose_dvfs(large,sw,a,a,68,3,1000,250,.05,false,25);
+    check(restricted.khz==a&&!restricted.feasible,"no feasible deadline under low ceiling: best effort");
 }
