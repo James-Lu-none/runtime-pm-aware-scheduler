@@ -32,6 +32,14 @@ Use -DPM_SYSTEM_NCNN=ON to use an installed ncnn package, or
     cmake --build build-test
     ctest --test-dir build-test --output-on-failure
 
+## MobileNetV4 workload
+
+Three pretrained Conv variants, RGB FP32 inference, numerical parity checks and
+workload-tagged profiles are supported by the new experimental path. See
+[MobileNetV4 setup and benchmark](docs/mobilenetv4.md). Generated model weights
+must be exported on a separate host or provided locally; hardware validation
+of this path is pending. Existing pooling runs remain supported.
+
 ## Workload
 
 The supplied network is a deterministic pooling/ReLU image-processing graph,
@@ -75,7 +83,9 @@ Use --gpu-index to select the verified physical device.
 
 Profile CSV format:
 
-    backend,state,cap_khz,p95_ms,energy_mj,power_w
+    backend,state,cap_khz,p95_ms,energy_mj,power_w,workload
+
+Legacy six-column profiles are accepted for pool only.
 
 CPU uses state active (its reference category); GPU uses observed
 active/suspended/unknown. Each profile belongs to one workload, CPU cap,

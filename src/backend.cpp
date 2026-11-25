@@ -42,21 +42,36 @@ Backend::Backend(const std::string& param, const std::string& bin,
         throw std::runtime_error("ncnn model load failed");
 }
 Backend::~Backend() = default;
-double Backend::run(const std::vector<unsigned char>& gray, int w, int h) {
-    ncnn::Mat in(w, h, 1);
+double Backend::run(const std::vector<unsigned char>& pixels, int w, int h, int channels,
+                    std::vector<float>* output) {
+    if ((channels != 1 && channels != 3) || pixels.size() != static_cast<size_t>(w)*h*channels)
+        throw std::runtime_error("Input shape mismatch");
+    ncnn::Mat in(w, h, channels);
     if (in.empty()) throw std::runtime_error("Input allocation failed");
-    float* p = in.channel(0);
-    for (size_t i = 0; i < gray.size(); ++i) p[i] = gray[i] / 255.f;
+    constexpr float mean[] = {.485f, .456f, .406f};
+    constexpr float stddev[] = {.229f, .224f, .225f};
+    for (int c = 0; c < channels; ++c) {
+        float* p = in.channel(c);
+        for (size_t i = 0; i < static_cast<size_t>(w)*h; ++i) {
+            const float x = pixels[i*channels+c] / 255.f;
+            p[i] = channels == 3 ? (x-mean[c])/stddev[c] : x;
+        }
+    }
     ncnn::Extractor ex = impl_->net.create_extractor();
     ncnn::Mat out;
     if (ex.input("input", in) || ex.extract("output", out) || out.empty())
         throw std::runtime_error("ncnn inference failed");
-    if (out.elembits() != 32) throw std::runtime_error("Expected FP32 output");
+    if (out.elembits() != 32 || out.elempack != 1) throw std::runtime_error("Expected unpacked FP32 output");
+    if (output) output->clear();
     // Read actual output, including GPU-to-CPU completion. Avoid padding in cstep.
     double checksum = 0.;
     for (int c = 0; c < out.c; ++c) {
         const float* q = out.channel(c);
-        for (size_t i = 0; i < static_cast<size_t>(out.w) * out.h * out.d * out.elempack; ++i) checksum += q[i];
+        for (size_t i = 0; i < static_cast<size_t>(out.w) * out.h * out.d; ++i) {
+            if (!std::isfinite(q[i])) throw std::runtime_error("Non-finite output");
+            checksum += q[i];
+            if (output) output->push_back(q[i]);
+        }
     }
     if (!std::isfinite(checksum)) throw std::runtime_error("Invalid output");
     return checksum;

@@ -4,3 +4,6 @@
 /models/*.bin
 __pycache__/
 *.pyc
+
+/models/mobilenetv4/
+/.venv-export/

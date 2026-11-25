@@ -10,7 +10,8 @@ public:
     Backend(const std::string& param, const std::string& bin,
             bool gpu, int threads, int gpu_index);
     ~Backend();
-    double run(const std::vector<unsigned char>& gray, int w, int h);
+    double run(const std::vector<unsigned char>& pixels, int w, int h, int channels = 1,
+               std::vector<float>* output = nullptr);
 };
 class VulkanContext {
 public:
