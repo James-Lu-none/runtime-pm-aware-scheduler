@@ -30,8 +30,8 @@ p.add_argument("--interval", type=float, default=0.5)
 p.add_argument("command", nargs=argparse.REMAINDER)
 a = p.parse_args()
 cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
-if not cmd or not 0.1 <= a.interval <= 10:
-    p.error("provide runner command after -- and interval 0.1..10 s")
+if not cmd or not 0.03 <= a.interval <= 10:
+    p.error("provide runner command after -- and interval 0.03..10 s")
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=False)
 (out / "command.txt").write_text(repr(cmd) + "\n")
