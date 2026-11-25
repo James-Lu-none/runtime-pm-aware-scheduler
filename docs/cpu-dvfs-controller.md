@@ -65,3 +65,20 @@ by_deadline.csv, plus original_settings.json. The wrapper restores the
 original governor/cap on normal exit, exceptions and handled signals.
 The C++ actuator also restores its initial cap on normal exit/unwind.
 SIGKILL/power loss cannot be handled. Stop other frequency controllers.
+
+## V2: release-aware look-ahead
+
+V1 `--mode dvfs` remains reactive. V2 `--mode lookahead` uses the known periodic release schedule. It selects the next job's target after the preceding job finishes, applies eligible downscales as early as dwell permits, and schedules upscales 150 ms before the next release (configurable). Only the predicted unhidden transition cost enters the deadline estimate. No extra idle parking cycles are introduced if the next job stays at the same high cap. The 150 ms initial lead is an engineering starting point based on the prior observed ~128 ms tails, not a guaranteed bound. All benchmark policies get the same 200 ms initial release offset. The experiment continues at 500 ms periods and uses the same models and deadlines.
+
+```sh
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+sudo python3 scripts/benchmark_cpu_dvfs.py --lookahead-only
+sudo python3 scripts/benchmark_cpu_dvfs.py --jobs 1200 --repeats 3
+```
+
+The default comparison now includes lookahead alongside fixed low/high, the native governor and reactive adaptive. `--lead-ms` controls the upscale lead; `--margin-ms` remains 3 by default to preserve the existing initial safety margin. Test larger margins separately: pre-switching can make 2.0 GHz feasible in the model where 2.4 GHz was previously selected. This can improve energy but may reduce actual deadline slack.
+
+New job columns record write time, first cap/frequency readback, elapsed transition, late flag, start/ready timestamps relative to first release (can be negative), overlap with the response critical path, and whether the switch completed before release. A target observed after the 100 ms soft limit is marked late, not reported as on-time success. Recovery is permitted up to max(500 ms, timeout); inability to observe a valid target within recovery aborts the run, and the wrapper restores original settings. Blocking sysfs calls cannot be interrupted by this software timeout. No claim of physical transition latency is made. The new summary includes pre-release switch counts, late transitions, P95 on-path switch delay, goodput and total rail energy per on-time job. Pre-release counts and total/late switch counts are pooled across repeats; switch latency statistics are medians of run-level percentiles.
+
+Use the same thermal settings and arrival pattern when comparing policies. Thermal derivative, independent power budget, online estimation and extra idle parking are deferred; V2 uses the existing optional ceiling and sampled safety abort. This is look-ahead for known arrivals, not a general online predictor. Energy remains approximate VDD_CORE rail integration; startup offset is included in the sampled window. Goodput denominator uses the nominal release horizon. A late transition may be hidden by advance scheduling and still meet the job deadline. All jobs are executed unless the run aborts on invalid hardware state.

@@ -92,7 +92,7 @@ def analyze(dest,label,repeat,a,cap):
         y<=x for x,y in zip(t,t[1:])):
         raise RuntimeError(f"Invalid telemetry: {dest}")
     elapsed=t[-1]-t[0]
-    horizon=a.jobs*a.period_ms/1000
+    horizon=(a.jobs*a.period_ms+a.startup_lead_ms)/1000
     energy=sum((w[i]+w[i-1])*.5*(t[i]-t[i-1]) for i in range(1,len(t)))
     response=[float(j["response_ms"]) for j in jobs]
     service=[float(j["service_ms"]) for j in jobs]
@@ -101,7 +101,11 @@ def analyze(dest,label,repeat,a,cap):
     if any(not math.isfinite(v) or v<0 for v in response+service+sw):
         raise RuntimeError(f"Invalid job latency: {dest}")
     misses=sum(int(j["deadline_miss"]) for j in jobs)
-    dynamic=label in ("adaptive","transition_blind")
+    late_switches=sum(int(j["transition_late"]) for j in changes)
+    pre_ready=sum(int(j["pre_release_ready"])==1 for j in changes)
+    on_path=[float(j["transition_on_path_ms"]) for j in changes]
+    on_time=len(jobs)-misses
+    dynamic=label in ("adaptive","transition_blind","lookahead")
     if dynamic:
         valid_caps=all(int(j["cap_khz"])==int(j["target_khz"])==int(j["reported_freq_khz"]) for j in jobs)
     else:
@@ -117,6 +121,10 @@ def analyze(dest,label,repeat,a,cap):
         approx_energy_mj_job=energy*1000/len(jobs),approx_energy_j=energy,
         sampled_s=elapsed,expected_horizon_s=horizon,coverage_ratio=elapsed/horizon,
         switches=len(changes),switch_p95_ms=percentile(sw,.95) if sw else 0.,
+        late_switches=late_switches,pre_release_switches=pre_ready,
+        on_path_switch_p95_ms=percentile(on_path,.95) if on_path else 0.,
+        goodput_jobs_s=on_time/(a.jobs*a.period_ms/1000),
+        energy_per_on_time_mj=energy*1000/on_time if on_time else None,
         switch_max_ms=max(sw) if sw else 0.,
         predicted_infeasible=sum(j["predicted_feasible"]=="0" for j in jobs) if dynamic else 0,
         max_temp_c=max(int(s["temp_mc"])/1000 for s in samples),
@@ -148,6 +156,9 @@ def main():
     p.add_argument("--repeats",type=int,default=1)
     p.add_argument("--native-governors",nargs="*",default=["original"])
     p.add_argument("--ablation",action="store_true",help="Include transition-blind selector")
+    p.add_argument("--lead-ms",type=int,default=150,help="Look-ahead upscale lead")
+    p.add_argument("--startup-lead-ms",type=int,default=200,help="Same initial release offset for all policies")
+    p.add_argument("--lookahead-only",action="store_true",help="Only run V2 for a smoke test")
     p.add_argument("--margin-ms",type=float,default=3)
     p.add_argument("--dwell-ms",type=float,default=250)
     p.add_argument("--min-saving",type=float,default=.05)
@@ -170,6 +181,7 @@ def main():
             1<=a.threads<=4 and 1<=a.repeats<=10 and
             math.isfinite(a.margin_ms) and a.margin_ms>=0 and math.isfinite(a.dwell_ms) and
             a.dwell_ms>=0 and 0<=a.min_saving<1 and
+            0<=a.lead_ms<=a.period_ms and 0<=a.startup_lead_ms<=1000 and
             0<a.thermal_low<a.thermal_high<=75 and 0<a.start_temp<a.max_temp<=75):
         p.error("Invalid workload/deadline cycle, timing, policy or thermal settings")
     for k in ("policy","zone","model_dir","runner","out"):
@@ -198,8 +210,11 @@ def sweep(a,cpu,trans,freqs):
     configs=[("fixed_low","performance",freqs[0]),("fixed_high","performance",freqs[-1])]
     configs.extend((g,g,orig_cap) for g in native if g!="performance")
     configs.append(("adaptive","performance",orig_cap))
+    configs.append(("lookahead","performance",orig_cap))
     if a.ablation:
         configs.append(("transition_blind","performance",orig_cap))
+    if a.lookahead_only:
+        configs=[x for x in configs if x[0]=="lookahead"]
     a.out.mkdir(parents=True,exist_ok=False)
     meta=dict(policy=str(a.policy),governor=orig_gov,min_khz=orig_min,max_khz=orig_cap,
               cpu_profile=str(cpu),transition_profile=str(trans),configs=configs,
@@ -209,6 +224,7 @@ def sweep(a,cpu,trans,freqs):
               jobs=a.jobs,period_ms=a.period_ms,threads=a.threads,repeats=a.repeats,
               margin_ms=a.margin_ms,dwell_ms=a.dwell_ms,min_saving=a.min_saving,use_max=a.use_max,
               thermal=a.thermal,thermal_low=a.thermal_low,thermal_high=a.thermal_high,
+              lead_ms=a.lead_ms,startup_lead_ms=a.startup_lead_ms,
               start_temp=a.start_temp,max_temp=a.max_temp,kernel=os.uname().release)
     (a.out/"original_settings.json").write_text(json.dumps(meta,indent=2)+"\n")
     print("Results:",a.out,flush=True)
@@ -227,13 +243,14 @@ def sweep(a,cpu,trans,freqs):
                 if int(read(minfile))!=orig_min:
                     raise RuntimeError("CPUFreq minimum changed")
                 dest=a.out/f"r{repeat}-{label}"
-                dynamic=label in ("adaptive","transition_blind")
+                dynamic=label in ("adaptive","transition_blind","lookahead")
                 cmd=[sys.executable,str(ROOT/"scripts/run.py"),"--out",str(dest),
                      "--policy",str(a.policy),"--zone",str(a.zone),"--interval","0.137",
-                     "--",str(a.runner),"--mode","dvfs" if dynamic else "cpu",
+                     "--",str(a.runner),"--mode","lookahead" if label=="lookahead" else ("dvfs" if dynamic else "cpu"),
                      "--gpu","0","--workload",",".join(a.models),"--model-dir",str(a.model_dir),
                      "--threads",str(a.threads),"--jobs",str(a.jobs),"--period-ms",str(a.period_ms),
                      "--deadlines-ms",",".join(map(str,a.deadlines)),"--tail-idle","1",
+                     "--startup-lead-ms",str(a.startup_lead_ms),
                      "--cpufreq-policy",str(a.policy),"--thermal-zone",str(a.zone),
                      "--thermal","1" if dynamic and a.thermal else "0",
                      "--thermal-low",str(a.thermal_low),"--thermal-high",str(a.thermal_high)]
@@ -241,7 +258,8 @@ def sweep(a,cpu,trans,freqs):
                     cmd+=["--cpu-costs",str(cpu/"cpu_costs.csv"),"--transition-costs",str(trans/"transition_costs.csv"),
                           "--dvfs-margin-ms",str(a.margin_ms),"--dvfs-dwell-ms",str(a.dwell_ms),
                           "--dvfs-min-saving",str(a.min_saving),"--dvfs-use-max",str(int(a.use_max)),
-                          "--dvfs-ignore-transition",str(int(label=="transition_blind"))]
+                          "--dvfs-ignore-transition",str(int(label=="transition_blind")),
+                          "--dvfs-lead-ms",str(a.lead_ms)]
                 print(f"=== repeat {repeat}: {label} ===",flush=True)
                 run_checked(cmd,env,a.zone,a.max_temp,a.out/f"{dest.name}.stderr.log")
                 if int(read(capfile))!=cap or read(govfile)!=gov or int(read(minfile))!=orig_min:
@@ -273,16 +291,23 @@ def sweep(a,cpu,trans,freqs):
         x=dict(policy=label,repeats=len(group),jobs=sum(g["jobs"] for g in group),
                misses=sum(g["misses"] for g in group))
         x["miss_pct"]=100*x["misses"]/x["jobs"]
-        for key in ("p95_response_ms","p99_response_ms","rail_w","approx_energy_mj_job","switches","switch_p95_ms"):
+        for key in ("p95_response_ms","p99_response_ms","rail_w","approx_energy_mj_job","switches","switch_p95_ms","on_path_switch_p95_ms"):
             x[key]=statistics.median(g[key] for g in group)
+        x["late_switches"]=sum(g["late_switches"] for g in group)
+        x["pre_release_switches"]=sum(g["pre_release_switches"] for g in group)
+        x["total_switches"]=sum(g["switches"] for g in group)
+        x["goodput_jobs_s"]=(x["jobs"]-x["misses"])/(x["jobs"]*a.period_ms/1000)
+        x["energy_per_on_time_mj"]=1000*sum(g["approx_energy_j"] for g in group)/(x["jobs"]-x["misses"]) if x["jobs"]>x["misses"] else None
         summary.append(x)
     if not summary:
         raise RuntimeError("No valid configurations")
     save(a.out/"summary.csv",summary)
-    print("\npolicy,misses,jobs,p95_response_ms,energy_mj_job,rail_w,switches,switch_p95_ms")
+    print("\npolicy,misses,jobs,p95_response_ms,energy_mj_job,rail_w,switches,switch_p95_ms,on_path_switch_p95_ms,pre_release_switches,total_switches,late_switches,goodput,energy_per_on_time_mj")
     for x in summary:
         print(f'{x["policy"]},{x["misses"]},{x["jobs"]},{x["p95_response_ms"]:.3f},'
-              f'{x["approx_energy_mj_job"]:.3f},{x["rail_w"]:.3f},{x["switches"]},{x["switch_p95_ms"]:.3f}')
+              f'{x["approx_energy_mj_job"]:.3f},{x["rail_w"]:.3f},{x["switches"]},{x["switch_p95_ms"]:.3f},'
+              f'{x["on_path_switch_p95_ms"]:.3f},{x["pre_release_switches"]},{x["total_switches"]},'
+              f'{x["late_switches"]},{x["goodput_jobs_s"]:.6f},{x["energy_per_on_time_mj"]}')
 
 if __name__=="__main__":
     try:
